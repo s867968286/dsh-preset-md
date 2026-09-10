@@ -15,6 +15,7 @@
     "src",
     "client",
     "templates",
+    "docs",
     "cordis.patch.yml",
     "README.md"
   ],
