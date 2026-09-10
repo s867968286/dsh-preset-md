@@ -38,11 +38,12 @@
     "@deepseek-ai/dsh-llm": "0.1.2-rc.1"
   },
   "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
     "@deepseek-ai/dsh-llm": "0.1.2-rc.1"
   },
   "scripts": {
     "test": "node --test",
-    "check": "node --check src/index.js && node --check src/preset.js && node --check client/client.js"
+    "check": "node --check src/index.js && node --check src/preset.js && node --check src/tools.mjs && node --check src/search.mjs && node --check client/client.js"
   },
   "keywords": [
     "dsh",

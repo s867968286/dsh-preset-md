@@ -50,15 +50,16 @@ DSH 的 agent preset 是一份插件行列表（`<dshHome>/.agent-presets/<id>/a
 
 ### 占位符
 
-正文里可以写下面三个占位符，在会话冻结时替换一次（同一会话内恒定）：
+正文里可以写下面四个占位符，在会话冻结时替换一次（同一会话内恒定）：
 
 | 占位符 | 替换为 |
 |---|---|
 | `{{cwd}}` | 当前会话的工作目录 |
-| `{{preset}}` | 当前 preset id |
+| `{{preset}}` | 当前 preset id（如 `agent-1bd5`） |
+| `{{presetDir}}` | 预设目录的绝对路径（六个 MD 与 `memory/` 所在目录） |
 | `{{session}}` | 当前会话 id |
 
-其余 `{{…}}` 原样保留，便于看出没生效。
+其余 `{{…}}` 原样保留，便于看出没生效。取不到值（例如会话没有 cwd）时同样原样保留。
 
 ## 安装
 
@@ -89,8 +90,8 @@ dsh plugin --profile <profile> add link:/绝对路径/dsh-preset-md
 目录取 `ctx.baseUrl`——preset 加载器会把它指向 `agent.cordis.yml` 所在目录，
 所以**插件行与那几个 Markdown 必须放在同一个 preset 目录里**。取不到时提示词为空并打一条 warn。
 
-> 从 GitHub 装的插件会走 `prepare` 脚本构建，pnpm 默认拦截该脚本；
-> 若安装后提示被拦，按它打印的 key 在 profile 目录的 `pnpm-workspace.yaml` 里加进 `allowBuilds` 再重跑。
+> 本插件不带构建步骤（无 `prepare` 脚本），从 GitHub 装不需要 `allowBuilds` 放行。
+> 若日后加了构建脚本，pnpm 会拦截它并打印所需 key，按提示加进 profile 目录的 `pnpm-workspace.yaml` 的 `allowBuilds` 再重跑即可。
 
 ## 收窄工具
 
@@ -124,25 +125,74 @@ agent 能看到的工具 = 全局层（profile 里装的插件）＋ preset 层�
 
 | 时机 | 条件 |
 |---|---|
-| 会话结束 | 必触发 |
+| 会话结束 | 必触发（绕过防抖；若正好有回顾在跑，排队等它结束后补跑） |
 | 回合结束 | 未总结轮数或新增字符数达到阈值 |
-| 防抖 | 短时间内不重复触发 |
+| 防抖 | 5 秒内不重复触发（只作用于「回合结束」这一路） |
+| 超时 | 单次回顾最长 2 分钟，超时中止并复位状态 |
+
+阈值设置（`reviewTurns` / `reviewChars`）会在读写时做校验：**非正数、空值或类型不符一律回落到默认值**。
+这一点很重要——阈值退化成 `0` 会让「未达阈值才跳过」的判断恒不成立，变成每个回合都跑一次 LLM 回顾。
+
+转写窗口**跟随 `reviewChars`**：阈值调大后回顾间隔变长，窗口同比例放大，
+两次回顾之间的内容不会被尾部截断丢掉。
 
 **一次回顾做两件事**（复用全局默认模型，单次调用）：
 
 1. **当天日志**：追加到 `memory/YYYY-MM-DD.md`，三段式——讨论与解决 / 关键信息 / 感悟；
 2. **记忆更新**：只允许改 `SOUL.md` / `IDENTITY.md` / `USER.md` / `MEMORY.md`，
    操作 `add` / `replace` / `remove`。`replace` / `remove` 的目标文本必须逐字来自原文且唯一，
-   否则该条被跳过——**永远不整文件覆盖**。
+   否则该条被跳过——**永远不整文件覆盖**。单条失败不影响后续条目。
+
+模型输出解析不出来时**会打一条 warn 并带上原文片段**，不会静默丢弃整轮回顾。
+
+**写回来的换行风格**：MD 文件若是 CRLF（Windows 编辑器保存过），改动后仍保持 CRLF，
+不会因为一次自动记忆就把整个文件的换行符换掉。
 
 **留痕**：每次改动前先写 `changelog/<文件名>.changelog.md`，一条记录一块，按块滚动裁剪，不切断单条记录。
 
-**检索**：注册只读工具 `preset_md_search`，让模型能翻自己的历史日志。
+## 上下文预算
+
+六个 MD 拼起来就是系统提示词，所以插件按**整体**管体积：
+
+| 项 | 默认 | 说明 |
+|---|---|---|
+| 预算 | 20000 字符 ≈ 9400 token | 可在「伙伴设置 → 参数」改；折算按 DeepSeek 口径（1 汉字 ≈ 0.6 token） |
+| 分配 | 按固定比例瓜分 | `MEMORY` 25% / `AGENTS` 22% / `SOUL` 20% / `IDENTITY` 13% / `SYSTEM` 12% / `USER` 8% |
+| 超限提醒 | **开** | 超预算时追加一段「请收敛」提醒；**不硬截断**——截断会把记忆切碎，比超一点更糟 |
+| 关掉提醒 | — | 只度量并打日志，不往提示词里加任何东西；预算仍然生效（日志照打） |
+
+单个文件偏大但总量没超 → **不提示**。只有整体越过预算线才提醒，并在提醒里点名偏重的文件，
+让模型自己在下次更新记忆时合并、精简、清理过期条目。
+
+启动时会打一条 info 日志，形如：
+
+```
+[preset-md] 注入体积 6031 字符 ≈ 2866 token，预算 20000（占 30%）| SYSTEM 533(9%) SOUL 1583(26%) ...
+```
+
+> 预算只管六个 MD。三个 `preset_md_*` 工具 schema 另占约 700 token，不含在内。
+
+**记忆工具**：注册三个 `preset_md_` 前缀工具，覆盖「读日志 / 写日志 / 更新记忆」。
+
+| 工具 | 用途 |
+|---|---|
+| `preset_md_search` | 只读：检索历史日志 |
+| `preset_md_journal` | 写入：把一段正文追加进当天日志（自动补日期头与时间标题） |
+| `preset_md_memory` | 写入：条目级更新 `IDENTITY.md` / `SOUL.md` / `USER.md` / `MEMORY.md` |
+
+`preset_md_search` 参数：
 
 | 参数 | 行为 |
 |---|---|
-| `days` | 按文件名算日期区间，默认最近 7 天 |
+| `days` | 最多回溯几个**有内容**的日志文件（不是自然日），默认 7 |
 | `query` | 全文逐行匹配，返回 `日期:行号` 与上下文；不填则返回日志索引 |
+
+`preset_md_memory` 参数：`file`（白名单枚举）、`op`（`add` / `replace` / `remove`）、`content`、`old_text`。
+`replace` / `remove` 的 `old_text` 必须逐字来自原文且全文唯一，否则被拒绝并提示先读文件。
+
+> **为什么不直接用 `write` / `edit` 直写文件**：后台自动记忆走 `memory-store` 的按路径写队列
+> （`enqueue`），直写不经过队列会与后台形成「读-改-写」竞态；而且直写绕过 `changelog` 留痕
+> 与 `old_text` 校验。这两个写入工具内部走 `appendJournal` / `applyUpdate`，三条保护都在。
 
 ## 伙伴设置
 
@@ -173,6 +223,7 @@ agent 能看到的工具 = 全局层（profile 里装的插件）＋ preset 层�
 ├── src/memory-store.mjs  日志追加 / 条目级更新 / changelog
 ├── src/review.mjs        回顾提示词 + 模型调用 + 结果解析
 ├── src/search.mjs        preset_md_search 工具
+├── src/tools.mjs         preset_md_journal / preset_md_memory 工具
 ├── src/settings.mjs      设置读写
 ├── src/templates.mjs     模板装载
 ├── templates/*.tpl       新建伙伴时写入的内置模板

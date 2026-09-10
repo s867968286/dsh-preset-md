@@ -36,8 +36,15 @@ export const PROMPT_ORDER = 0
  */
 export const DEFAULT_FILES = ['SYSTEM.md', 'SOUL.md', 'IDENTITY.md', 'USER.md', 'AGENTS.md', 'MEMORY.md']
 
-/** 可在 MD 正文里使用的占位符（会话冻结时替换一次）。 */
-export const PLACEHOLDERS = ['cwd', 'preset', 'session']
+/**
+ * 可在 MD 正文里使用的占位符（会话冻结时替换一次）。
+ *
+ * - `cwd`：会话的工作目录（`session.header.cwd`）
+ * - `preset`：预设的 id（如 `agent-1bd5`），不是路径
+ * - `presetDir`：预设目录的绝对路径（`ctx.baseUrl` 解析而来），即本助手六个 MD 与 memory/ 所在目录
+ * - `session`：会话 id
+ */
+export const PLACEHOLDERS = ['cwd', 'preset', 'presetDir', 'session']
 
 /** 展开开头的 ~（支持 ~ 与 ~/xxx）。 */
 export function expandHome(input) {
@@ -139,26 +146,153 @@ export function readAggregateText(dir, files = DEFAULT_FILES) {
   return parts.length > 0 ? parts.join('\n\n') : ''
 }
 
-/** 从会话上下文里取可用于占位符替换的事实。 */
-export function contextFacts(input) {
+/* ────────────────────────── 上下文预算与体积度量 ──────────────────────────
+ * 只管「整体」：六个 MD 拼起来的总长度是否越过预算线。单个文件偏大但整体
+ * 没超，不算问题——各文件按下面的比例天然瓜分预算，不需要逐个设限。
+ * -------------------------------------------------------------------- */
+
+/** 六个文件瓜分预算的权重（合计 1.0），按「该文件天然该有多少内容」分配。 */
+export const FILE_WEIGHTS = {
+  'SYSTEM.md': 0.12,
+  'SOUL.md': 0.20,
+  'IDENTITY.md': 0.13,
+  'USER.md': 0.08,
+  'AGENTS.md': 0.22,
+  'MEMORY.md': 0.25,
+}
+
+/**
+ * 系统提示词的默认预算（字符）。
+ *
+ * DeepSeek 官方口径：1 个汉字 ≈ 0.6 token。莉莉实例实测 6041 字符 ≈ 2866 token，
+ * 约合 0.47 token/字符（中文为主、混少量 ASCII）。
+ * 10000 token ÷ 0.47 ≈ 21000 字符，取 20000 —— 留一点余量，不让它刚好卡在线上。
+ */
+export const DEFAULT_CONTEXT_BUDGET = 20000
+
+/** 实测的混合文本折算比（token / 字符），用于把预算换算成 token 展示。 */
+export const CHARS_PER_TOKEN = 0.47
+
+/**
+ * 估算一段文本的 token 数（DeepSeek 口径）。
+ *
+ * 分三类加权：汉字/CJK 标点 0.6、ASCII 0.28、空白 0.2。
+ * 仅供体积提示用，不参与任何功能判断。
+ */
+export function estimateTokens(text) {
+  const source = String(text || '')
+  if (!source) return 0
+  const cjk = (source.match(/[\u4e00-\u9fff]/g) || []).length
+  const cjkPunct = (source.match(/[\u3000-\u303f\uff00-\uffef]/g) || []).length
+  const whitespace = (source.match(/\s/g) || []).length
+  const ascii = source.length - cjk - cjkPunct - whitespace
+  return Math.round(cjk * 0.6 + cjkPunct * 0.6 + ascii * 0.28 + whitespace * 0.2)
+}
+
+/**
+ * 量一遍预设目录的体积。
+ *
+ * @returns {{
+ *   files: Array<{file: string, chars: number, tokens: number, weight: number, share: number}>,
+ *   totalChars: number, totalTokens: number,
+ *   budgetChars: number, budgetTokens: number,
+ *   ratio: number, over: boolean,
+ *   heaviest: Array<{file: string, chars: number, ratio: number}>
+ * }}
+ */
+export function measureContext(dir, { budgetChars = DEFAULT_CONTEXT_BUDGET, files = DEFAULT_FILES } = {}) {
+  const budget = Number.isFinite(budgetChars) && budgetChars > 0 ? budgetChars : DEFAULT_CONTEXT_BUDGET
+  const rows = []
+  let totalChars = 0
+
+  for (const file of files) {
+    const text = dir ? readSectionText(join(dir, file)) : ''
+    const chars = text.length
+    totalChars += chars
+    rows.push({ file, chars, tokens: estimateTokens(text), weight: FILE_WEIGHTS[file] ?? 0, share: 0 })
+  }
+
+  // 每个文件「应得」的预算份额 + 当前占总额的比例
+  for (const row of rows) {
+    row.share = totalChars > 0 ? row.chars / totalChars : 0
+  }
+
+  const ratio = budget > 0 ? totalChars / budget : 0
+  // 超预算才提示；同时列出超过自己那份份额最明显的文件，供模型参考
+  const heaviest = rows
+    .filter((row) => row.weight > 0)
+    .map((row) => ({ file: row.file, chars: row.chars, ratio: row.weight > 0 ? row.chars / (budget * row.weight) : 0 }))
+    .filter((row) => row.ratio > 1)
+    .sort((a, b) => b.ratio - a.ratio)
+    .slice(0, 3)
+
+  return {
+    files: rows,
+    totalChars,
+    totalTokens: estimateTokens(readAggregateText(dir, files)),
+    budgetChars: budget,
+    // 预算本身只是个字符数，按实测的混合比例折算成 token 供参考
+    budgetTokens: Math.round(budget * CHARS_PER_TOKEN),
+    ratio,
+    over: totalChars > budget,
+    heaviest,
+  }
+}
+
+/**
+ * 生成注入体积的告警文本；未超预算返回 ''。
+ *
+ * 只在**整体**超预算时才提醒，并且是交给模型的「请收敛」提示，
+ * 不做硬截断——截断会把记忆切碎，比超一点更糟。
+ */
+export function contextBudgetNotice(measure, { warnAt = 1 } = {}) {
+  if (!measure || !measure.over || measure.ratio < warnAt) return ''
+  const bits = [
+    `## 上下文预算提醒`,
+    '',
+    `六个文件拼起来共 ${measure.totalChars} 字符（约 ${measure.totalTokens} token），` +
+      `已超出预算 ${measure.budgetChars} 字符（${Math.round(measure.ratio * 100)}%）。`,
+  ]
+  if (measure.heaviest.length > 0) {
+    const list = measure.heaviest.map((row) => `\`${row.file}\`（超出应得份额 ${Math.round(row.ratio * 100)}%）`).join('、')
+    bits.push('', `偏重的是：${list}。`)
+  }
+  bits.push(
+    '',
+    '请在下次更新记忆时主动收敛：合并重复条目、把细节移进日志只留一条线索、删掉已经过期的内容。',
+    '不要整段删除仍在生效的约定——精炼，不是清空。',
+  )
+  return bits.join('\n')
+}
+
+/**
+ * 从会话上下文里取可用于占位符替换的事实。
+ * @param {object} input - 会话上下文（assemble context / agent / session 都兼容）。
+ * @param {string} [presetDir] - 预设目录绝对路径，来自 `ctx.baseUrl`（会话上下文里没有）。
+ */
+export function contextFacts(input, presetDir = '') {
   const agent = input?.agent ?? input
   const session = agent?.session ?? input?.session
   const header = session?.header ?? {}
   return {
     cwd: typeof header.cwd === 'string' ? header.cwd : '',
     preset: typeof header.agentPreset === 'string' ? header.agentPreset : '',
+    presetDir: typeof presetDir === 'string' ? presetDir : '',
     session: typeof session?.id === 'string' ? session.id : '',
   }
 }
 
 /**
- * 替换 MD 正文里的占位符：`{{cwd}}` / `{{preset}}` / `{{session}}`。
+ * 替换 MD 正文里的占位符：`{{cwd}}` / `{{preset}}` / `{{presetDir}}` / `{{session}}`。
  * 未识别的 `{{…}}` 与取不到值的占位符**原样保留**（便于看出没生效）。
  * 替换发生在会话冻结之前，所以同一会话内恒定。
+ *
+ * 注意：`presetDir` 必须排在 `preset` 之前 —— 正则的选择分支是从左到右匹配的，
+ * 让更长的名字先试，避免 `{{presetDir}}` 被 `preset` 抢先匹配。
  */
 export function substitutePlaceholders(text, facts) {
   if (!text) return text
-  return text.replace(/\{\{\s*(cwd|preset|session)\s*\}\}/g, (match, key) => {
+  return text.replace(/\{\{\s*(cwd|presetDir|preset|session)\s*\}\}/g, (match, key) => {
     const value = facts?.[key]
     return typeof value === 'string' && value.length > 0 ? value : match
   })
@@ -180,14 +314,37 @@ export function registerPrompt(ctx, options = {}) {
   const sectionName = options.sectionName ?? PROMPT_SECTION
   const order = Number.isFinite(options.order) ? options.order : PROMPT_ORDER
   const complete = options.complete === true
+  const budgetChars = Number.isFinite(options.budgetChars) && options.budgetChars > 0 ? options.budgetChars : DEFAULT_CONTEXT_BUDGET
+  const budgetNotice = options.budgetNotice !== false
   const cache = createSessionFreeze()
 
-  /** 变量 provider：每步被调用；冻结开启时同一会话只读盘一次。 */
+  /**
+   * 变量 provider：每步被调用；冻结开启时同一会话只读盘一次。
+   *
+   * 缓存键：优先用会话 id。取不到 id 时**不能退化成单一常量键** ——
+   * 那样所有拿不到 id 的会话会共用第一份渲染结果，`{{cwd}}` 之类的替换值会串味。
+   * 改为把 cwd 一并编进键：同一会话稳定命中，不同工作目录互不污染。
+   */
+  const cacheKeyOf = (context) => {
+    const session = sessionKeyOf(context)
+    if (session) return session
+    const facts = contextFacts(context, dir)
+    return `__no_session__:${facts.cwd || '-'}:${facts.presetDir || '-'}`
+  }
+
   const read = (context) => {
     if (!dir) return ''
-    const produce = () => substitutePlaceholders(readAggregateText(dir), contextFacts(context))
+    const produce = () => {
+      const body = substitutePlaceholders(readAggregateText(dir), contextFacts(context, dir))
+      // 整体超预算时追加一段「请收敛」提示；超限判断发生在替换之后，
+      // 因为 {{presetDir}} 之类的替换值也会占体积。
+      // budgetNotice 关掉后只度量、不注入，方便想看日志但不想让模型被提醒的场景。
+      if (!budgetNotice) return body
+      const notice = contextBudgetNotice(measureContext(dir, { budgetChars }), { warnAt: Number.isFinite(options.warnAt) ? options.warnAt : 1 })
+      return notice ? `${body}\n\n${notice}` : body
+    }
     if (!freeze) return produce()
-    return cache.get(sessionKeyOf(context) || '__preset__', produce)
+    return cache.get(cacheKeyOf(context), produce)
   }
   ctx.systemPrompt.variable(variable, read)
 
@@ -205,7 +362,7 @@ export function registerPrompt(ctx, options = {}) {
     return { file, filePath, exists: filePath ? existsSync(filePath) : false }
   })
 
-  return { dir, files, cache, freeze, variable, sectionName, order, complete }
+  return { dir, files, cache, freeze, variable, sectionName, order, complete, budgetChars, budgetNotice, cacheKeyOf }
 }
 
 /**

@@ -11,14 +11,18 @@ import { pathToFileURL } from 'node:url'
 
 import {
   DEFAULT_FILES,
+  FILE_WEIGHTS,
   PLACEHOLDERS,
   PROMPT_SECTION,
   PROMPT_VARIABLE,
   applyToolRestriction,
+  contextBudgetNotice,
   contextFacts,
   createSessionFreeze,
+  estimateTokens,
   expandHome,
   matchToolName,
+  measureContext,
   normalizeConfig,
   normalizeToolFilter,
   readAggregateText,
@@ -80,7 +84,7 @@ test('toDirectoryPath：file URL 与绝对路径都能解析，相对路径返�
 
 test('默认清单与占位符', () => {
   assert.deepEqual(DEFAULT_FILES, ['SYSTEM.md', 'SOUL.md', 'IDENTITY.md', 'USER.md', 'AGENTS.md', 'MEMORY.md'])
-  assert.deepEqual(PLACEHOLDERS, ['cwd', 'preset', 'session'])
+  assert.deepEqual(PLACEHOLDERS, ['cwd', 'preset', 'presetDir', 'session'])
 })
 
 test('normalizeConfig：只认 tools，其余字段忽略', () => {
@@ -136,12 +140,32 @@ test('createSessionFreeze：只算一次、可清理', () => {
 
 test('contextFacts / substitutePlaceholders', () => {
   const facts = contextFacts({ agent: { session: { id: 's1', header: { cwd: 'D:/ws', agentPreset: 'demo' } } } })
-  assert.deepEqual(facts, { cwd: 'D:/ws', preset: 'demo', session: 's1' })
-  assert.deepEqual(contextFacts(undefined), { cwd: '', preset: '', session: '' })
+  assert.deepEqual(facts, { cwd: 'D:/ws', preset: 'demo', presetDir: '', session: 's1' })
+  assert.deepEqual(contextFacts(undefined), { cwd: '', preset: '', presetDir: '', session: '' })
   assert.equal(substitutePlaceholders('目录 {{cwd}}', facts), '目录 D:/ws')
   assert.equal(substitutePlaceholders('{{ preset }}', facts), 'demo')
   assert.equal(substitutePlaceholders('{{unknown}}', facts), '{{unknown}}')
   assert.equal(substitutePlaceholders('{{cwd}}', { cwd: '' }), '{{cwd}}')
+})
+
+test('contextFacts / substitutePlaceholders：presetDir 独立于 preset', () => {
+  const facts = contextFacts(
+    { agent: { session: { id: 's1', header: { cwd: 'D:/ws', agentPreset: 'agent-1bd5' } } } },
+    'C:/Users/x/.dsh/.agent-presets/agent-1bd5',
+  )
+  assert.equal(facts.preset, 'agent-1bd5', 'preset 仍是 id，不是路径')
+  assert.equal(facts.presetDir, 'C:/Users/x/.dsh/.agent-presets/agent-1bd5')
+
+  assert.equal(
+    substitutePlaceholders('预设目录（{{presetDir}}），id={{preset}}', facts),
+    '预设目录（C:/Users/x/.dsh/.agent-presets/agent-1bd5），id=agent-1bd5',
+  )
+  // presetDir 排在前：不会被 preset 抢先匹配掉
+  assert.equal(substitutePlaceholders('{{presetDir}}', { preset: 'id', presetDir: 'D:/p' }), 'D:/p')
+  // 取不到值 → 原样保留
+  assert.equal(substitutePlaceholders('{{presetDir}}', { presetDir: '' }), '{{presetDir}}')
+  assert.equal(substitutePlaceholders('{{presetDir}}', {}), '{{presetDir}}')
+  assert.equal(substitutePlaceholders('{{ presetDir }}', { presetDir: 'D:/p' }), 'D:/p')
 })
 
 test('registerPrompt：变量承载内容 + 唯一 complete section', () => {
@@ -196,6 +220,128 @@ test('registerPrompt：占位符按会话替换并参与冻结；目录未知返
   const empty = registerPrompt(emptyCtx, {})
   assert.equal(empty.dir, '')
   assert.equal(emptyCtx.variables.get(PROMPT_VARIABLE)(asSession('s1')), '')
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('registerPrompt：{{presetDir}} 注入为预设目录绝对路径，与 {{cwd}} 相互独立', () => {
+  const dir = makePresetDir({ 'SYSTEM.md': '工作目录：{{cwd}}\n预设目录：{{presetDir}}' })
+  const ctx = makeCtx(pathToFileURL(dir).href)
+  registerPrompt(ctx, {})
+  const read = ctx.variables.get(PROMPT_VARIABLE)
+  const session = (cwd) => ({ agent: { session: { id: 's1', header: { cwd } } } })
+
+  assert.equal(read(session('D:/ws')), `工作目录：D:/ws\n预设目录：${dir}`)
+  const other = read(session('D:/other'))
+  assert.ok(other.includes(`预设目录：${dir}`), 'presetDir 不随 cwd 变化')
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('registerPrompt：模板里未出现的占位符不影响输出', () => {
+  const dir = makePresetDir({ 'AGENTS.md': '这个预设目录（{{presetDir}}）就是你的家' })
+  const ctx = makeCtx(pathToFileURL(dir).href)
+  registerPrompt(ctx, {})
+  assert.equal(ctx.variables.get(PROMPT_VARIABLE)(asSession('s1')), `这个预设目录（${dir}）就是你的家`)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('registerPrompt：取不到会话 id 时按 cwd 分桶，不共用同一份缓存', () => {
+  const dir = makePresetDir({ 'SYSTEM.md': '工作目录：{{cwd}}' })
+  const ctx = makeCtx(pathToFileURL(dir).href)
+  const prompt = registerPrompt(ctx, {})
+  const read = ctx.variables.get(PROMPT_VARIABLE)
+
+  // 没有 session.id / agent.id 的上下文
+  const noId = (cwd) => ({ session: { header: { cwd } } })
+  assert.equal(read(noId('D:/ws-a')), '工作目录：D:/ws-a')
+  assert.equal(read(noId('D:/ws-b')), '工作目录：D:/ws-b', '不同 cwd 不能被第一份缓存污染')
+  assert.equal(read(noId('D:/ws-a')), '工作目录：D:/ws-a', '同 cwd 仍然命中缓存')
+
+  // 两个不同的缓存键（而不是共用一个常量键）
+  const keyA = prompt.cacheKeyOf(noId('D:/ws-a'))
+  const keyB = prompt.cacheKeyOf(noId('D:/ws-b'))
+  assert.notEqual(keyA, keyB)
+  assert.equal(prompt.cache.size, 2)
+  assert.equal(prompt.cacheKeyOf(noId('D:/ws-a')), keyA, '同一 cwd 的键要稳定')
+
+  // 有会话 id 时仍然按 id 分桶
+  assert.equal(prompt.cacheKeyOf(asSession('s9')), 's9')
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('estimateTokens：按 DeepSeek 口径估算（1 汉字 ≈ 0.6 token）', () => {
+  assert.equal(estimateTokens(''), 0)
+  // 10 个汉字 ≈ 6 token
+  assert.equal(estimateTokens('一二三四五六七八九十'), 6)
+  // ASCII 权重明显低于汉字
+  assert.ok(estimateTokens('a'.repeat(100)) < estimateTokens('一'.repeat(100)))
+})
+
+test('measureContext：按比例瓜分整体预算，只在总量超限时报 over', () => {
+  const dir = makePresetDir({
+    'SYSTEM.md': '一'.repeat(100),
+    'MEMORY.md': '二'.repeat(500),
+  })
+  const measure = measureContext(dir, { budgetChars: 1000 })
+  assert.equal(measure.totalChars, 600)
+  assert.equal(measure.over, false, '总量没超预算就不该报 over')
+  assert.equal(measure.budgetChars, 1000)
+
+  // 各文件占比之和为 1
+  const shareSum = measure.files.reduce((n, row) => n + row.share, 0)
+  assert.ok(Math.abs(shareSum - 1) < 1e-9, '占比之和应为 1')
+
+  // 权重表合计为 1
+  const weightSum = Object.values(FILE_WEIGHTS).reduce((n, w) => n + w, 0)
+  assert.ok(Math.abs(weightSum - 1) < 1e-9, '权重合计应为 1')
+
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('measureContext：单文件偏大但总量没超 → over 为假、不提示', () => {
+  // MEMORY.md 占 90%，远超它的 25% 份额，但总量仍低于预算
+  const dir = makePresetDir({ 'MEMORY.md': '一'.repeat(900), 'SOUL.md': '二'.repeat(100) })
+  const measure = measureContext(dir, { budgetChars: 2000 })
+  assert.equal(measure.over, false)
+  assert.equal(contextBudgetNotice(measure), '', '总量没超就不该产出提醒')
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('contextBudgetNotice：总量超限才产出提醒，并点名偏重文件', () => {
+  const dir = makePresetDir({ 'MEMORY.md': '一'.repeat(2000), 'SOUL.md': '二'.repeat(100) })
+  const measure = measureContext(dir, { budgetChars: 1000 })
+  assert.equal(measure.over, true)
+  const notice = contextBudgetNotice(measure)
+  assert.ok(notice.includes('上下文预算提醒'))
+  assert.ok(notice.includes('MEMORY.md'), '应点名偏重的文件')
+  assert.ok(notice.includes('收敛'))
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('registerPrompt：总量超预算时把收敛提醒附在提示词末尾', () => {
+  const dir = makePresetDir({ 'MEMORY.md': '一'.repeat(3000) })
+  const ctx = makeCtx(pathToFileURL(dir).href)
+  registerPrompt(ctx, { budgetChars: 1000 })
+  const text = ctx.variables.get(PROMPT_VARIABLE)(asSession('s1'))
+  assert.ok(text.includes('## 上下文预算提醒'))
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('registerPrompt：总量没超预算时提示词里没有提醒', () => {
+  const dir = makePresetDir({ 'MEMORY.md': '一'.repeat(100) })
+  const ctx = makeCtx(pathToFileURL(dir).href)
+  registerPrompt(ctx, { budgetChars: 1000 })
+  const text = ctx.variables.get(PROMPT_VARIABLE)(asSession('s1'))
+  assert.ok(!text.includes('上下文预算提醒'))
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('registerPrompt：超限提醒可单独关掉（只度量不注入）', () => {
+  const dir = makePresetDir({ 'MEMORY.md': '一'.repeat(3000) })
+  const ctx = makeCtx(pathToFileURL(dir).href)
+  registerPrompt(ctx, { budgetChars: 1000, budgetNotice: false })
+  const text = ctx.variables.get(PROMPT_VARIABLE)(asSession('s1'))
+  assert.ok(!text.includes('上下文预算提醒'), '关掉后不该注入提醒')
+  assert.ok(text.includes('一'), '正文照常注入')
   rmSync(dir, { recursive: true, force: true })
 })
 

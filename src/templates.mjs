@@ -25,9 +25,17 @@ function readTemplate(name) {
   return readFileSync(join(TEMPLATE_DIR, `${name}.tpl`), 'utf8')
 }
 
-/** 渲染某个 MD 的初始内容。 */
+/**
+ * 渲染某个 MD 的初始内容。
+ *
+ * 用「函数式替换」而不是字符串替换：`String.replaceAll(pattern, string)` 的替换串里
+ * `$&`、`$1`、`` $` `` 有特殊含义，昵称/用户名含这些字符时会被就地展开成 `{name}`
+ * 之类的字面量，模板直接被污染。
+ */
 export function renderTemplate(file, { name, userName = '用户' }) {
-  return readTemplate(file).replaceAll('{name}', name).replaceAll('{user}', userName)
+  return readTemplate(file)
+    .replaceAll('{name}', () => name)
+    .replaceAll('{user}', () => userName)
 }
 
 /** 渲染整套 MD（file -> content）。 */

@@ -19,13 +19,13 @@ export const MAX_HITS = 30
  * 在日志里检索。
  * @param {string} dir - preset 目录
  * @param {string} [query] - 关键词；空则返回索引
- * @param {number} [days] - 最近多少天，默认 7
+ * @param {number} [days] - 最多回溯几个「有内容」的日志文件（不是自然日），默认 7
  * @returns {string} 供模型阅读的文本
  */
 export function searchJournal(dir, query, days = 7) {
   const span = Number.isFinite(days) && days > 0 ? Math.floor(days) : 7
   const files = listJournalFiles(dir, span)
-  if (files.length === 0) return `（最近 ${span} 天没有日志）`
+  if (files.length === 0) return `（最近 ${span} 个日志文件里没有内容）`
 
   const keyword = String(query || '').trim()
   if (!keyword) {
@@ -58,7 +58,7 @@ export function searchJournal(dir, query, days = 7) {
   }
   return hits.length > 0
     ? hits.join('\n\n')
-    : `（最近 ${span} 天日志里没有匹配「${keyword}」的内容）`
+    : `（最近 ${span} 个日志文件里没有匹配「${keyword}」的内容）`
 }
 
 /** 构造 `preset_md_search` 的工具定义（parameters 为标准 JSON Schema 形态）。 */
@@ -66,14 +66,17 @@ export function createSearchTool(dir) {
   return {
     name: SEARCH_TOOL_NAME,
     description:
-      '在助手的记忆日志（memory/YYYY-MM-DD.md）里检索。带 query 时按关键词找原文片段，不带 query 时返回最近几天的日志索引。用来回忆过去聊过什么、当时结论是什么。',
+      '在助手的记忆日志（memory/YYYY-MM-DD.md）里检索。带 query 时按关键词找原文片段，不带 query 时返回最近几个日志文件的索引。用来回忆过去聊过什么、当时结论是什么。',
     // parameters 必须是标准 JSON Schema：register() 会原样透传给 provider，
     // 扁平写法（{query:{...}}）会被判非法。
     parameters: {
       type: 'object',
       properties: {
         query: { type: 'string', description: '关键词；不填则返回最近日志的索引' },
-        days: { type: 'number', description: '检索最近多少天的日志，默认 7' },
+        days: {
+          type: 'number',
+          description: '最多回溯几个「有内容」的日志文件（不是自然日），默认 7。日志只在有对话时生成，所以按文件计数比按天更可靠。',
+        },
       },
     },
     output: {

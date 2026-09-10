@@ -68,10 +68,13 @@ window.__ModuleLoader__.load({
       '.pmd-perm{display:flex;flex-direction:column}',
       '.pmd-perm>.pmd-set-row{padding:10px 0 8px}',
       '.pmd-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;padding:0 0 14px;max-width:420px}',
-      '.pmd-fields label{display:flex;flex-direction:column;gap:5px;color:var(--dsw-alias-label-secondary,#6b6b6b);font-size:12px;line-height:16px}',
+      '.pmd-fields label{display:flex;flex-direction:column;gap:5px;color:var(--dsw-alias-label-secondary,#6b6b6b);font-size:12px;line-height:16px;font-weight:500}',
       '.pmd-fields input{width:100%;box-sizing:border-box;height:34px;border:.5px solid var(--dsw-alias-border-l4,#d9d9d9);border-radius:9px;padding:0 10px;background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-primary,#1f1f1f);font:inherit;font-size:13px}',
       '.pmd-fields input:focus{outline:none;border-color:var(--dsw-alias-brand-primary,#4a7dff)}',
       '.pmd-fields input:disabled{opacity:.45;cursor:default}',
+      '.pmd-fields-single{grid-template-columns:minmax(0,1fr);max-width:260px;padding-bottom:6px}',
+      // 平铺项（注入预算）与开关标题同级：同字号、同字重、同主色，别再比大类小一号。
+      '.pmd-fields-lg label{font-size:14px;font-weight:500;color:var(--dsw-alias-label-primary,#1f1f1f);line-height:21px}',
       '.pmd-switch{box-sizing:border-box;background:var(--dsw-alias-border-l3,#b8b8b8);cursor:pointer;border:0;border-radius:10px;flex:none;width:36px;height:20px;padding:2px;position:relative;transition:background-color .14s}',
       '.pmd-switch-on{background:var(--dsw-alias-brand-primary,#4a7dff)}',
       '.pmd-switch:disabled{cursor:default;opacity:.5}',
@@ -103,13 +106,19 @@ window.__ModuleLoader__.load({
 
     async function call(path, options) {
       const response = await fetch(`${API}${path}`, options)
+      const text = await response.text()
       let payload = null
-      try {
-        payload = await response.json()
-      } catch {
-        payload = null
+      if (text) {
+        try {
+          payload = JSON.parse(text)
+        } catch {
+          payload = null
+        }
       }
       if (!response.ok) throw new Error((payload && payload.error) || `HTTP ${response.status}`)
+      // 2xx 但 body 为空/非 JSON：给一个能定位的错误，不要让它变成
+      // 调用点的 "Cannot read properties of null"
+      if (payload === null) throw new Error(`${path} 返回了空响应（HTTP ${response.status}）`)
       return payload
     }
 
@@ -134,17 +143,15 @@ window.__ModuleLoader__.load({
     function ParamsTab() {
       const [settings, setSettings] = React.useState(null)
       const [message, setMessage] = React.useState('')
+      // 数字输入框的原始文本：清空时不能直接 Number('')（= 0），
+      // 否则阈值退化成「每轮都触发」。留原文，只在解析出合法值时才更新 settings。
+      const [drafts, setDrafts] = React.useState({})
 
       React.useEffect(() => {
         call('/settings').then((data) => setSettings(data.settings)).catch((error) => setMessage(String(error.message)))
       }, [])
 
       if (!settings) return h('div', { className: 'pmd-hint' }, message || '加载中…')
-
-      const set = (key) => (event) => {
-        const value = event.target.type === 'checkbox' ? event.target.checked : Number(event.target.value)
-        setSettings({ ...settings, [key]: value })
-      }
 
       const toggle = (key) => h('button', {
         type: 'button',
@@ -154,17 +161,28 @@ window.__ModuleLoader__.load({
         onClick: () => setSettings({ ...settings, [key]: !settings[key] }),
       }, h('span', { className: 'pmd-thumb' }))
 
-      const num = (key, label, min, step, unit = '轮') => {
-        const disabled = !settings.autoMemory
+      const num = (key, label, min, step, unit, gated = true) => {
+        // gated：是否受「自动记忆」总开关支配。注入预算与自动记忆无关，不该跟着变灰。
+        const disabled = gated && !settings.autoMemory
+        const shown = drafts[key] !== undefined ? drafts[key] : String(settings[key])
+        const onInput = (event) => {
+          const raw = event.target.value
+          setDrafts({ ...drafts, [key]: raw })
+          const parsed = Number(raw)
+          // 空串 / 非数字 / 低于下限 → 不回写 settings，等用户改对
+          if (raw.trim() === '' || !Number.isFinite(parsed) || parsed < min) return
+          setSettings({ ...settings, [key]: Math.floor(parsed) })
+        }
         return h('label', { key },
-          `${label}（${unit}）`,
+          unit ? `${label}（${unit}）` : label,
           h('input', {
             type: 'number',
             min,
             step,
-            value: settings[key],
+            value: shown,
             disabled,
-            onChange: set(key),
+            onChange: onInput,
+            onBlur: () => setDrafts({ ...drafts, [key]: undefined }),
           }))
       }
 
@@ -172,6 +190,7 @@ window.__ModuleLoader__.load({
         try {
           const data = await call('/settings', json('PUT', settings))
           setSettings(data.settings)
+          setDrafts({})
           setMessage('已保存。新会话生效。')
         } catch (error) {
           setMessage(`保存失败：${error.message}`)
@@ -184,20 +203,34 @@ window.__ModuleLoader__.load({
           desc ? h('span', null, desc) : null),
         toggle(key))
 
+      // 后端还没返回预算字段时（旧进程）不显示 NaN，只留比例说明。
+      // 这段并入「超限提醒」开关的说明里，不单独占一行——否则会把开关行的右端挤出对齐。
+      const budgetChars = Number(settings.contextBudget)
+      const budgetKnown = Number.isFinite(budgetChars) && budgetChars > 0
+      const budgetHint = (budgetKnown ? `当前 ${budgetChars} 字符 ≈ ${Math.round(budgetChars * 0.47)} token。` : '') +
+        '各文件按固定比例瓜分这份预算（MEMORY 25% / AGENTS 22% / SOUL 20% / IDENTITY 13% / SYSTEM 12% / USER 8%），' +
+        '单个文件偏大但总量没超不会提示。'
+
       return h('div', { className: 'pmd-root' },
         h('div', { className: 'pmd-hint' }, '这些开关影响此后新建的会话（预设是「创建时组装」的）。'),
         h('div', { className: 'pmd-perm' },
           setRow('autoMemory', '自动记忆',
             '开：后台自动整理日记、更新记忆。关：不写日记也不动记忆，只有手动检索可用。'),
           h('div', { className: 'pmd-fields' },
-            num('reviewTurns', '触发轮数', 1, undefined),
-            num('reviewChars', '触发字符数', 200, 200, '字符'))),
-        setRow('freeze', '会话内冻结提示词',
-          '开：同一会话只读一次文件，改动需新开对话。关：每一步都重新读文件，改完立即生效。'),
-        setRow('complete', '独占系统提示词',
-          '开：系统提示词只保留本插件的 MD 内容，官方内置提示和其它插件注入的提示全部丢弃。关：都保留，一起生效。'),
-        setRow('suppressRuntimeContext', '抑制运行时上下文快照',
-          '开：禁用运行时上下文快照注入（也包含第三方插件的快照注入，但部分插件可能不失效）。关：允许注入。'),
+            num('reviewTurns', '触发轮数', 1, undefined, '轮'),
+            num('reviewChars', '触发字符数', 200, 200, '字符')),
+          setRow('freeze', '会话内冻结提示词',
+            '开：同一会话只读一次文件，改动需新开对话。关：每一步都重新读文件，改完立即生效。'),
+          setRow('complete', '独占系统提示词',
+            '开：系统提示词只保留本插件的 MD 内容，官方内置提示和其它插件注入的提示全部丢弃。关：都保留，一起生效。'),
+          setRow('suppressRuntimeContext', '抑制运行时上下文快照',
+            '开：禁用运行时上下文快照注入（也包含第三方插件的快照注入，但部分插件可能不失效）。关：允许注入。'),
+          h('div', { className: 'pmd-sep' }),
+          h('div', { className: 'pmd-fields pmd-fields-single pmd-fields-lg' },
+            num('contextBudget', '注入预算', 2000, 1000, '字符', false)),
+          setRow('budgetNotice', '超限提醒',
+            '开：六个文件总量超出预算时，在提示词末尾附一段「请收敛」提醒，让模型自己精简。' +
+            '关：只度量并打日志，不往提示词里加任何东西。两种情况都不硬截断。' + budgetHint)),
         h('div', { className: 'pmd-row' },
           h('button', { className: 'pmd-btn pmd-btn-primary', type: 'button', onClick: save }, '保存'),
           h('span', { className: 'pmd-hint' }, message)),
@@ -214,6 +247,8 @@ window.__ModuleLoader__.load({
       const [copyName, setCopyName] = React.useState('')
       const [copying, setCopying] = React.useState(false)
       const [copyError, setCopyError] = React.useState('')
+      // 每张卡片的删除中状态：防止同一秒内双击导致备份目录重名
+      const [deleting, setDeleting] = React.useState('')
 
       const load = React.useCallback(() => {
         call('/agents').then((data) => setAgents(data.agents)).catch((error) => setMessage(String(error.message)))
@@ -233,16 +268,20 @@ window.__ModuleLoader__.load({
       }
 
       const remove = async (agent) => {
+        if (deleting) return
         const ok = typeof window !== 'undefined' && window.confirm
           ? window.confirm(`删除「${agent.name}」？\n\n只是移动到备份目录，不会真的删除；旧对话仍可查看，新会话不再出现。`)
           : true
         if (!ok) return
+        setDeleting(agent.id)
         try {
           const data = await call(`/agents/${agent.id}`, { method: 'DELETE' })
           setMessage(`已移动到备份：${data.archived}`)
           load()
         } catch (error) {
           setMessage(`删除失败：${error.message}`)
+        } finally {
+          setDeleting('')
         }
       }
 
@@ -332,6 +371,7 @@ window.__ModuleLoader__.load({
               className: 'pmd-icon-btn pmd-icon-btn-danger',
               type: 'button',
               title: '删除',
+              disabled: deleting === agent.id,
               'aria-label': `删除：${agent.name}`,
               onClick: () => remove(agent),
             }, h(IconTrashOutline16)))))),
