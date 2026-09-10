@@ -62,9 +62,19 @@ DSH 的 agent preset 是一份插件行列表（`<dshHome>/.agent-presets/<id>/a
 
 ## 安装
 
+尚未发布到 npm，请从 GitHub 安装：
+
 ```sh
 # 装进某个 profile（推荐：可用完整的「伙伴设置」页面）
-dsh plugin --profile <profile> add dsh-preset-md
+dsh plugin --profile <profile> add github:s867968286/dsh-preset-md
+```
+
+装完**重启 dsh**：bundle 不热重载，已挂载的组合不会热替换模块。
+
+本地开发时改用 link：
+
+```sh
+dsh plugin --profile <profile> add link:/绝对路径/dsh-preset-md
 ```
 
 也可以不安装，直接在 preset 里用绝对路径引用 preset 行入口，此时只有提示词注入与自动记忆，没有设置页。
@@ -78,6 +88,9 @@ dsh plugin --profile <profile> add dsh-preset-md
 
 目录取 `ctx.baseUrl`——preset 加载器会把它指向 `agent.cordis.yml` 所在目录，
 所以**插件行与那几个 Markdown 必须放在同一个 preset 目录里**。取不到时提示词为空并打一条 warn。
+
+> 从 GitHub 装的插件会走 `prepare` 脚本构建，pnpm 默认拦截该脚本；
+> 若安装后提示被拦，按它打印的 key 在 profile 目录的 `pnpm-workspace.yaml` 里加进 `allowBuilds` 再重跑。
 
 ## 收窄工具
 
