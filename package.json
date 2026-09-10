@@ -1,0 +1,58 @@
+{
+  "name": "dsh-preset-md",
+  "version": "0.1.0",
+  "description": "给 DSH 助手赋予人格、灵魂与长期记忆：用 Markdown 定义伙伴的身份、性格、准则与记忆，自动写日记、自动更新记忆。Give your DSH assistant a soul, personality, and long-term memory.",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./preset": "./src/preset.js",
+    "./core": "./src/core.js",
+    "./client": "./client/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "client",
+    "templates",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-llm": "0.1.2-rc.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh-llm": "0.1.2-rc.1"
+  },
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check src/index.js && node --check src/preset.js && node --check client/client.js"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "persona",
+    "soul",
+    "memory",
+    "companion",
+    "ai-assistant",
+    "agent-preset",
+    "markdown",
+    "system-prompt"
+  ]
+}
