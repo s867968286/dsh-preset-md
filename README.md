@@ -6,11 +6,19 @@
 > Give your DSH assistant a **soul, personality, and long-term memory** — define a companion's
 > identity, character, and memory in Markdown, with automatic journals and memory updates.
 
+> **本项目由 AI 生成**：代码与文档均由 AI 编码代理产出并迭代，人类负责需求、设计与实机验证。
+
 DSH 的 agent preset 是一份插件行列表（`<dshHome>/.agent-presets/<id>/agent.cordis.yml`）。
 本插件让一个 preset 从**自己的目录**读取几个约定好的 Markdown 文件，拼成该会话**唯一**的系统提示词；
 同时在后台按天写日志、按条目更新记忆文件。
 
 提示词按会话冻结：改文件后新开一个对话即可生效，运行中的会话不受影响。
+
+## 预览
+
+| 伙伴列表 | 参数设置 | 提示词编辑 |
+| :---: | :---: | :---: |
+| ![伙伴列表](docs/screenshots/companion-list.png) | ![参数设置](docs/screenshots/companion-params.png) | ![提示词编辑](docs/screenshots/companion-edit-prompt.png) |
 
 ## 文件约定
 
@@ -187,6 +195,20 @@ npm run check     # 语法检查
 `agent-preset` · `markdown` · `system-prompt`
 
 人格 · 灵魂 · 记忆 · 助手 · 伙伴 · 预设 · 提示词
+
+## 致谢与借鉴
+
+本项目参考了以下两个开源项目，**仅借鉴设计思路与文件约定，代码为独立实现**：
+
+| 项目 | 地址 | 借鉴点 |
+|---|---|---|
+| dsh-claw-suite | https://github.com/xingyingyuzhui/dsh-claw-suite | 用约定的 Markdown（`SOUL` / `IDENTITY` / `AGENTS`）承载人设并注入系统提示词，`USER` / `MEMORY` ＋ `memory/YYYY-MM-DD.md` 日记另行注入与回合后回顾；在设置页里按页签读写这些文件的交互思路 |
+| DeepSeek-Harness-Hanako-Memory | https://github.com/moononnn/DeepSeek-Harness-Hanako-Memory | 卡片式伙伴管理界面与预设增删改的交互思路（本项目按官方 UI 规范重写，未照搬其界面代码） |
+
+也感谢官方 `@deepseek-ai/dsh` 提供的 agent-presets / settings / home-paths 机制。
+
+**关于 AI 生成**：本项目的代码、文档与界面实现均由 AI 编码代理生成并多轮迭代，
+人类负责需求定义、架构决策与实机验证。使用前请自行审阅，生产环境请谨慎评估。
 
 ## 许可
 
