@@ -492,27 +492,33 @@ export function applyToolRestriction(ctx, tools) {
     return { applied: false, reason: 'ctx.tools.restrict 不可用' }
   }
 
-  const scope = ctx?.agent
   const errors = []
   let known = []
 
+  /*
+   * 绝不读 `ctx.agent`：在 preset 这一层它是隔离开的 per-agent 服务，直接读属性会抛
+   * `cannot get property "agent" without inject`，而这个异常就落在下面同一段 try 里，
+   * 被当成「工具名单读不出来」——`deny` 于是静默失效（切预设时那条 loader 报错即此）。
+   * 收窄本来也不需要 agent：`restrict()` 自己从它的 ctx 解析 scope。
+   */
+
   /**
-   * 首选 `view(scope).restrictableNames`：它正是 `restrict()` 用来校验名单的那份
-   * 集合，且**不做 schema 投影**。dsh 0.1.5-rc.2 起 `schemas()` 在非 native 呈现
-   * 模式（进程设了 `DSH_TOOLS_MODE=both|ptc`）下会先 `requireCodeRuntime(mode)`，
-   * 缺 `codeRuntime` 就整份名单读不出来，`deny` 随之静默失效。
+   * 首选 `view().restrictableNames`（不传 scope = 全局视图）：它正是 `restrict()` 用来
+   * 校验名单的那份集合，且**不做 schema 投影**。dsh 0.1.5-rc.2 起 `schemas()` 在非
+   * native 呈现模式（进程设了 `DSH_TOOLS_MODE=both|ptc`）下会先 `requireCodeRuntime`，
+   * 缺 `codeRuntime` 就整份名单读不出来。
    */
   try {
-    const names = registry.view?.(scope)?.restrictableNames
+    const names = registry.view?.()?.restrictableNames
     if (names) known = [...names].filter((name) => typeof name === 'string')
   } catch (error) {
     errors.push('view: ' + (error instanceof Error ? error.message : String(error)))
   }
 
-  /* 兜底：老版本没有 view() 时仍走 schemas()。 */
+  /* 兜底：老版本没有 view() 时仍走 schemas()（同样不传 scope）。 */
   if (known.length === 0) {
     try {
-      const schemas = typeof registry.schemas === 'function' ? registry.schemas(scope) : []
+      const schemas = typeof registry.schemas === 'function' ? registry.schemas() : []
       known = [...new Set((schemas ?? []).map((schema) => schema?.name).filter(Boolean))]
     } catch (error) {
       errors.push('schemas: ' + (error instanceof Error ? error.message : String(error)))
@@ -531,12 +537,7 @@ export function applyToolRestriction(ctx, tools) {
       applied: false,
       reason: '读取可见工具名单失败，无法展开模式',
       error: errors.join(' | '),
-      scopeKind: scope === undefined ? 'undefined' : scope === null ? 'null' : typeof scope,
-      scopeKeys: scope && typeof scope === 'object' ? Object.keys(scope).slice(0, 24) : [],
     }
-  }
-  if (known.length === 0) {
-    return { applied: false, reason: '当前没有可见工具，模式无需展开' }
   }
 
   const expand = (patterns) => {

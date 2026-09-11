@@ -184,16 +184,12 @@ export function apply(ctx, rawConfig) {
       logger.info?.(`[preset-md] 工具收窄已生效：${bits.join(' ')}`)
     } else if (result.reason) {
       /*
-       * 把真实异常一并打出来：早先只写 reason 的固定文案，升级到 dsh 0.1.5-rc.2 后
-       * 这条 warn 连刷十几次都看不出根因（schemas() 为什么抛错），只能靠读 dsh 源码猜。
-       * scope 形态（ctx.agent 是 undefined 还是对象）决定了是「没有 agent scope」
-       * 还是「某个工具的 schema 无法投影」，两者修法完全不同。
+       * 把真实异常一并打出来：早先只写一句固定文案，升级到 dsh 0.1.5-rc.2 后这条 warn
+       * 连刷十几次都看不出根因，只能靠读 dsh 源码猜。真实原因（读 `ctx.agent` 撞隔离
+       * 边界）就是这样逼出来的，之后不要再把异常吞成散文。
        */
-      const detail = []
-      if (result.error) detail.push(`错误=${result.error}`)
-      if (result.scopeKind) detail.push(`ctx.agent=${result.scopeKind}`)
-      if (result.scopeKeys?.length) detail.push(`agent键=[${result.scopeKeys.join(',')}]`)
-      logger.warn?.(`[preset-md] 工具收窄未生效：${result.reason}${detail.length > 0 ? ' | ' + detail.join(' | ') : ''}`)
+      const detail = result.error ? ` | 错误=${result.error}` : ''
+      logger.warn?.(`[preset-md] 工具收窄未生效：${result.reason}${detail}`)
     }
     if (result.unmatched?.length) {
       logger.warn?.(`[preset-md] 以下工具模式未匹配到任何可见工具：${result.unmatched.join(', ')}`)

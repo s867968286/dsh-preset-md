@@ -486,19 +486,36 @@ test('applyToolRestriction：restrict 抛错与 ctx.tools 缺失都降级', () =
  */
 test('applyToolRestriction：schemas 抛错也能靠 view 拿到名单（0.1.5-rc.2 回归）', () => {
   const calls = []
+  const viewArgs = []
+  /*
+   * 同时钉死两件事：
+   * 1. 主路径走 view().restrictableNames，与 schemas() 是否可用无关；
+   * 2. 绝不读 `ctx.agent`（下面用 getter 陷阱模拟 cordis：读到就抛
+   *    `cannot get property "agent" without inject`）。收窄不需要 agent，
+   *    restrict() 自己解析 scope。
+   */
   const ctx = {
-    agent: {},
     tools: {
-      view: () => ({ restrictableNames: new Set(['mnemon_recall', 'mnemon_remember', 'read']) }),
+      view: (...args) => {
+        viewArgs.push(args.length)
+        return { restrictableNames: new Set(['mnemon_recall', 'mnemon_remember', 'read']) }
+      },
       schemas: () => {
         throw new Error('mode "both" requires a code runtime')
       },
       restrict: (filter) => calls.push(filter),
     },
   }
+  Object.defineProperty(ctx, 'agent', {
+    enumerable: true,
+    get() {
+      throw new Error('cannot get property "agent" without inject')
+    },
+  })
   const result = applyToolRestriction(ctx, { allow: [], deny: ['mnemon*'] })
   assert.equal(result.applied, true)
   assert.deepEqual(calls, [{ deny: ['mnemon_recall', 'mnemon_remember'] }])
+  assert.deepEqual(viewArgs, [0])
 })
 
 test('applyToolRestriction：没有 view 时回落 schemas 列举', () => {
@@ -516,7 +533,6 @@ test('applyToolRestriction：没有 view 时回落 schemas 列举', () => {
 
 test('applyToolRestriction：两条路径都抛错时报告真实原因', () => {
   const ctx = {
-    agent: { id: 'a1' },
     tools: {
       view: () => {
         throw new Error('view boom')
@@ -529,7 +545,10 @@ test('applyToolRestriction：两条路径都抛错时报告真实原因', () => 
   }
   const result = applyToolRestriction(ctx, { allow: [], deny: ['mnemon*'] })
   assert.equal(result.applied, false)
+  /*
+   * 两条路径的异常都要留在 error 里：这是这次故障最贵的教训——真实原因被吞成一句
+   * 散文，排查只能靠读 dsh 源码。
+   */
   assert.match(result.error, /view boom/)
   assert.match(result.error, /schemas boom/)
-  assert.equal(result.scopeKind, 'object')
 })
