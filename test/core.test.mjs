@@ -29,6 +29,7 @@ import {
   readSectionText,
   registerPrompt,
   resolvePresetDir,
+  sessionEvents,
   sessionKeyOf,
   substitutePlaceholders,
   toDirectoryPath,
@@ -55,7 +56,12 @@ function makeCtx(baseUrl) {
     systemPrompt: {
       section(section) {
         sections.push(section)
-        return () => {}
+        // 真实注册表是「按名字唯一」的：disposer 必须真的撤掉，
+        // 否则测不出「撤旧建新」是否正确（同名重复注册在真实环境会抛错）。
+        return () => {
+          const index = sections.indexOf(section)
+          if (index >= 0) sections.splice(index, 1)
+        }
       },
       variable(name, provider) {
         variables.set(name, provider)
@@ -122,6 +128,68 @@ test('sessionKeyOf：兼容 assemble context / agent / 空值', () => {
   assert.equal(sessionKeyOf({ id: 'a1', session: { id: 's1' } }), 's1')
   assert.equal(sessionKeyOf({ id: 'a1' }), 'a1')
   assert.equal(sessionKeyOf({}), '')
+})
+
+test('sessionEvents：优先 snapshotEvents，兼容 events 数组与 ownEvents', () => {
+  // 真实 Session 形态：**没有 events 属性**，事件只能通过 snapshotEvents() 读。
+  // 这条用例是「自动日记永远写不出来」那个线上 bug 的回归锁。
+  const real = [{ type: 'user/message' }]
+  assert.deepEqual(sessionEvents({ id: 's1', snapshotEvents: () => real }), real)
+
+  // 假 ctx / 旧形态：只有 events 数组
+  assert.equal(sessionEvents({ events: [{ type: 'x' }] }).length, 1)
+
+  // 仅 ownEvents() 可用时兜底
+  assert.equal(sessionEvents({ ownEvents: () => [{ type: 'y' }] }).length, 1)
+
+  // 什么都没有、或非对象 → 空数组，不抛错
+  assert.deepEqual(sessionEvents({}), [])
+  assert.deepEqual(sessionEvents(undefined), [])
+  assert.deepEqual(sessionEvents(null), [])
+
+  // snapshotEvents 抛错或返回非数组 → 静默回落，不影响调用方
+  const throwing = { snapshotEvents: () => { throw new Error('boom') }, events: [{ type: 'z' }] }
+  assert.equal(sessionEvents(throwing).length, 1)
+  assert.equal(sessionEvents({ snapshotEvents: () => undefined, events: [{ type: 'w' }] }).length, 1)
+})
+
+test('registerPrompt：complete 实时切换（撤旧建新，不重复注册）', () => {
+  const dir = makePresetDir({ 'SOUL.md': 'x' })
+  const ctx = makeCtx(pathToFileURL(dir).href)
+  let complete = true
+  registerPrompt(ctx, { getSettings: () => ({ complete, freeze: true, budgetNotice: false }) })
+  const read = ctx.variables.get(PROMPT_VARIABLE)
+
+  assert.equal(ctx.sections.length, 1)
+  assert.equal(ctx.sections[0].complete, true)
+
+  // 设置改成 false → 下一次渲染时重建 section
+  complete = false
+  read(asSession('s1'))
+  assert.equal(ctx.sections.length, 1, '同名 section 必须撤旧再建，不能累积')
+  assert.equal('complete' in ctx.sections[0], false, '应变成普通 section')
+
+  // 再切回 true
+  complete = true
+  read(asSession('s1'))
+  assert.equal(ctx.sections.length, 1)
+  assert.equal(ctx.sections[0].complete, true)
+
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('registerPrompt：budgetNotice 实时开关（关掉后不再注入收敛提醒）', () => {
+  const dir = makePresetDir({ 'MEMORY.md': '一'.repeat(3000) })
+  const ctx = makeCtx(pathToFileURL(dir).href)
+  let budgetNotice = true
+  registerPrompt(ctx, { getSettings: () => ({ budgetNotice, contextBudget: 1000, freeze: false }) })
+  const read = ctx.variables.get(PROMPT_VARIABLE)
+
+  assert.ok(read(asSession('s1')).includes('上下文预算提醒'))
+  budgetNotice = false
+  assert.ok(!read(asSession('s1')).includes('上下文预算提醒'), '关掉后应实时停止注入')
+
+  rmSync(dir, { recursive: true, force: true })
 })
 
 test('createSessionFreeze：只算一次、可清理', () => {
@@ -408,4 +476,60 @@ test('applyToolRestriction：restrict 抛错与 ctx.tools 缺失都降级', () =
   const missing = applyToolRestriction({}, { allow: [], deny: ['a'] })
   assert.equal(missing.applied, false)
   assert.match(missing.reason, /不可用/)
+})
+
+/*
+ * 回归防线：dsh 0.1.5-rc.2 起 `schemas()` 在非 native 呈现模式（进程设了
+ * DSH_TOOLS_MODE=both|ptc）下会先 requireCodeRuntime(mode)，缺 codeRuntime 就整份
+ * 名单读不出来，deny 静默失效（现象：工具照样出现在模型工具表里）。
+ * 因此主路径必须是不做 schema 投影的 view().restrictableNames。
+ */
+test('applyToolRestriction：schemas 抛错也能靠 view 拿到名单（0.1.5-rc.2 回归）', () => {
+  const calls = []
+  const ctx = {
+    agent: {},
+    tools: {
+      view: () => ({ restrictableNames: new Set(['mnemon_recall', 'mnemon_remember', 'read']) }),
+      schemas: () => {
+        throw new Error('mode "both" requires a code runtime')
+      },
+      restrict: (filter) => calls.push(filter),
+    },
+  }
+  const result = applyToolRestriction(ctx, { allow: [], deny: ['mnemon*'] })
+  assert.equal(result.applied, true)
+  assert.deepEqual(calls, [{ deny: ['mnemon_recall', 'mnemon_remember'] }])
+})
+
+test('applyToolRestriction：没有 view 时回落 schemas 列举', () => {
+  const calls = []
+  const ctx = {
+    tools: {
+      schemas: () => [{ name: 'mnemon_recall' }, { name: 'read' }],
+      restrict: (filter) => calls.push(filter),
+    },
+  }
+  const result = applyToolRestriction(ctx, { allow: [], deny: ['mnemon*'] })
+  assert.equal(result.applied, true)
+  assert.deepEqual(calls, [{ deny: ['mnemon_recall'] }])
+})
+
+test('applyToolRestriction：两条路径都抛错时报告真实原因', () => {
+  const ctx = {
+    agent: { id: 'a1' },
+    tools: {
+      view: () => {
+        throw new Error('view boom')
+      },
+      schemas: () => {
+        throw new Error('schemas boom')
+      },
+      restrict: () => {},
+    },
+  }
+  const result = applyToolRestriction(ctx, { allow: [], deny: ['mnemon*'] })
+  assert.equal(result.applied, false)
+  assert.match(result.error, /view boom/)
+  assert.match(result.error, /schemas boom/)
+  assert.equal(result.scopeKind, 'object')
 })

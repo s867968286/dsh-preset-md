@@ -13,17 +13,20 @@ import { atomicWrite, readText } from './memory-store.mjs'
 /** 默认设置。 */
 export const DEFAULT_SETTINGS = {
   autoMemory: true,
-  reviewTurns: 10,
-  reviewChars: 8000,
+  // 触发阈值（满足其一即触发）：
+  // 一次有实质内容的往来通常 2~3 轮就够；2000 字符约等于一次中等长度的往返。
+  // 旧默认（10 轮 / 8000 字符）在短会话里几乎不可能达到，只能靠「会话结束」兜底，
+  // 而会话结束只在 agent 销毁（关窗口、切会话）时发生，体感就是「根本不触发」。
+  reviewTurns: 3,
+  reviewChars: 2000,
   freeze: true,
   complete: true,
-  suppressRuntimeContext: true,
   contextBudget: DEFAULT_CONTEXT_BUDGET,
   budgetNotice: true,
 }
 
 /** 布尔开关的键。 */
-const BOOLEAN_KEYS = ['autoMemory', 'freeze', 'complete', 'suppressRuntimeContext', 'budgetNotice']
+const BOOLEAN_KEYS = ['autoMemory', 'freeze', 'complete', 'budgetNotice']
 /** 数值键。 */
 export const NUMERIC_KEYS = ['reviewTurns', 'reviewChars', 'contextBudget']
 

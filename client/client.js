@@ -191,7 +191,7 @@ window.__ModuleLoader__.load({
           const data = await call('/settings', json('PUT', settings))
           setSettings(data.settings)
           setDrafts({})
-          setMessage('已保存。新会话生效。')
+          setMessage('已保存，立即生效。')
         } catch (error) {
           setMessage(`保存失败：${error.message}`)
         }
@@ -212,7 +212,7 @@ window.__ModuleLoader__.load({
         '单个文件偏大但总量没超不会提示。'
 
       return h('div', { className: 'pmd-root' },
-        h('div', { className: 'pmd-hint' }, '这些开关影响此后新建的会话（预设是「创建时组装」的）。'),
+        h('div', { className: 'pmd-hint' }, '这些开关即时生效：运行中的会话下一个回合就会按新值走。'),
         h('div', { className: 'pmd-perm' },
           setRow('autoMemory', '自动记忆',
             '开：后台自动整理日记、更新记忆。关：不写日记也不动记忆，只有手动检索可用。'),
@@ -223,8 +223,6 @@ window.__ModuleLoader__.load({
             '开：同一会话只读一次文件，改动需新开对话。关：每一步都重新读文件，改完立即生效。'),
           setRow('complete', '独占系统提示词',
             '开：系统提示词只保留本插件的 MD 内容，官方内置提示和其它插件注入的提示全部丢弃。关：都保留，一起生效。'),
-          setRow('suppressRuntimeContext', '抑制运行时上下文快照',
-            '开：禁用运行时上下文快照注入（也包含第三方插件的快照注入，但部分插件可能不失效）。关：允许注入。'),
           h('div', { className: 'pmd-sep' }),
           h('div', { className: 'pmd-fields pmd-fields-single pmd-fields-lg' },
             num('contextBudget', '注入预算', 2000, 1000, '字符', false)),
@@ -497,7 +495,7 @@ window.__ModuleLoader__.load({
         try {
           await call(`/agents/${id}/file`, json('PUT', { file: tab, content: draft }))
           setAgent({ ...agent, files: { ...agent.files, [tab]: draft } })
-          setMessage(`${tab} 已保存。新会话生效。`)
+          setMessage(`${tab} 已保存。若开着「会话内冻结提示词」，需新开对话才生效。`)
         } catch (error) {
           setMessage(`保存失败：${error.message}`)
         }

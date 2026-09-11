@@ -46,7 +46,8 @@ export function createJournalTool(dir) {
         body: {
           type: 'string',
           description:
-            '日志正文（Markdown）。建议沿用现有格式，三段小标题：### 讨论与解决 / ### 关键信息 / ### 感悟。',
+            '日志正文（Markdown）。最前面写一行「> 摘要：…」（本段最核心的结论，不超过 50 字），' +
+            '然后是三段小标题：### 讨论与解决 / ### 关键信息 / ### 感悟。摘要行会被检索索引直接展示。',
         },
       },
       required: ['body'],

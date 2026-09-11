@@ -8,10 +8,19 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { appendJournal, changelogPath, journalPath } from '../src/memory-store.mjs'
-import { SEARCH_TOOL_NAME, createSearchTool, searchJournal } from '../src/search.mjs'
-import { buildReviewInput, buildTranscript, callText, parseReviewJson, runReview } from '../src/review.mjs'
+import { INDEX_CLIP_CHARS, SEARCH_TOOL_NAME, clip, createSearchTool, searchJournal } from '../src/search.mjs'
+import { buildReviewInput, buildTranscript, callText, parseReviewJson, REVIEW_SYSTEM_PROMPT, runReview } from '../src/review.mjs'
 
 const makeDir = () => mkdtempSync(join(tmpdir(), 'preset-md-search-'))
+
+/**
+ * 假 ctx：模型服务只能通过 `ctx.get('llm')` 取。
+ *
+ * 真实环境里 `ctx.llm` 属性访问会撞上 preset 的 isolate 边界并抛
+ * `cannot get property "llm" without inject`；假 ctx 若只挂一个 llm 属性，
+ * 就会把这条真实约束彻底掩盖（单测绿、线上炸）。
+ */
+const llmCtx = (stream) => ({ get: (name) => (name === 'llm' ? { stream } : undefined) })
 
 /* ───────────────────────────── 检索 ───────────────────────────── */
 
@@ -21,14 +30,53 @@ test('searchJournal：没有日志时给出提示', () => {
   rmSync(dir, { recursive: true, force: true })
 })
 
-test('searchJournal：无 query 返回索引（日期 + 段落标题 + 首句）', async () => {
+test('searchJournal：无 query 返回索引（日期 + 段落标题 + 摘要行）', async () => {
   const dir = makeDir()
-  await appendJournal(dir, '### 讨论与解决\n\n聊了插件设计', new Date(2026, 8, 9, 10, 0))
+  // 按约定正文以「> 摘要」开头：索引应取摘要行，跳过 ### 小标题
+  await appendJournal(
+    dir,
+    '> 摘要：聊了插件设计\n\n### 讨论与解决\n\n细节过程\n\n### 关键信息\n\n结论 B',
+    new Date(2026, 8, 9, 10, 0),
+  )
   const text = searchJournal(dir, '', 3)
   assert.ok(text.includes('# 2026-09-09'))
   assert.ok(text.includes('## 10:00'))
+  assert.ok(text.includes('> 摘要：聊了插件设计'))
+  assert.ok(!text.includes('细节过程'), '索引只露首行，不透出正文')
+  assert.ok(!text.includes('结论 B'), '三段正文不进索引')
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('searchJournal：无摘要的旧格式日志回退取首个非标题行', async () => {
+  const dir = makeDir()
+  await appendJournal(dir, '### 讨论与解决\n\n聊了插件设计', new Date(2026, 8, 9, 10, 0))
+  const text = searchJournal(dir, '', 3)
   assert.ok(text.includes('聊了插件设计'))
   rmSync(dir, { recursive: true, force: true })
+})
+
+test('searchJournal：索引行超长截断补省略号', () => {
+  assert.equal(clip('短行'), '短行')
+  const long = '长'.repeat(100)
+  const clipped = clip(long)
+  assert.equal(clipped.length, INDEX_CLIP_CHARS + 1)
+  assert.ok(clipped.endsWith('…'), '截断必须带省略号')
+})
+
+test('REVIEW_SYSTEM_PROMPT：段落可省、寒暄与测试不记、当天已有日志仍要写', () => {
+  const prompt = REVIEW_SYSTEM_PROMPT
+  assert.ok(prompt.includes('> 摘要：'), '要给出摘要行格式示例')
+  assert.ok(prompt.includes('50'), '摘要要有长度约束')
+  // 摘要与各段落都允许为空：判据是「有没有值得留存的新内容」，不是「格式填满」
+  assert.ok(prompt.includes('省略它'), '摘要允许省略')
+  assert.ok(prompt.includes('不要求写满'), '段落不要求写满')
+  // 不需要记录的情形（判据的核心）
+  assert.ok(prompt.includes('不要记录'))
+  for (const scene of ['无意义寒暄', '简单问题', '测试性对话', '操作确认', '重复内容']) {
+    assert.ok(prompt.includes(scene), `排除清单应包含：${scene}`)
+  }
+  // 与「当天已有日志」的措辞配套：不重复旧的，但新内容照写
+  assert.ok(prompt.includes('不要因为它们存在就留空'))
 })
 
 test('searchJournal：关键词命中返回 日期:行号 + 上下文', async () => {
@@ -93,7 +141,7 @@ test('runReview：转写窗口跟随触发阈值，不丢两次回顾之间的�
   ]
   let seenPrompt = ''
   const ctx = {
-    llm: {
+    get: (name) => (name === 'llm' ? {
       stream: (options) => {
         seenPrompt = options.messages[0].content[0].text
         return (async function* () {
@@ -101,7 +149,7 @@ test('runReview：转写窗口跟随触发阈值，不丢两次回顾之间的�
           yield { type: 'finish', reason: { kind: 'stop' } }
         })()
       },
-    },
+    } : undefined),
   }
 
   // 默认窗口 8000：开头的标志词会被截掉
@@ -149,6 +197,30 @@ test('parseReviewJson：彻底解析不了时带回原文片段（不静默）',
   assert.ok(parsed.raw.length > 0, '必须带回原文片段供调用方告警')
 })
 
+test('buildReviewInput：当天已有日志时必须说清「别重复旧的、但本轮照常新增」', () => {
+  // 这条锁的是一个真实事故：早先只写「今天的日志（已存在，不要重复写）」，
+  // 模型读成「今天已经记过了，不用再写」，当天已有日志的轮次全部返回空 journal，
+  // 日记就此断掉（20:14 那轮「无改动」就是它）。
+  const text = buildReviewInput({ transcript: 't', todayJournal: '## 09:00\n旧段落', files: [] })
+  assert.ok(text.includes('今天的日志'))
+  assert.ok(text.includes('不要重复'), '要说明别重复旧内容')
+  assert.ok(text.includes('照常再写一个新段落'), '必须同时说明本轮照常新增，否则模型会整轮留空')
+})
+
+test('runReview：模型没产出日志段落时打上 journalEmpty 标记', async () => {
+  const dir = makeDir()
+  const events = [{ type: 'user/message', data: { content: [{ type: 'text', text: 'x'.repeat(200) }] } }]
+  const ctx = llmCtx(() => (async function* () {
+    yield { type: 'text-delta', text: '{"journal":"","updates":[]}' }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  })())
+  const result = await runReview({ ctx, dir, session: { events }, provider: 'p', model: 'm', now: new Date(2026, 8, 9, 10, 0) })
+  assert.equal(result.journalEmpty, true, '调用方要能区分「模型没写日志」和「记忆无改动」')
+  assert.equal(result.applied.length, 0)
+  assert.ok(!existsSync(journalPath(dir, '2026-09-09')))
+  rmSync(dir, { recursive: true, force: true })
+})
+
 test('buildReviewInput：包含对话、今日日志与各文件原文', () => {
   const text = buildReviewInput({
     transcript: '用户：hi',
@@ -168,17 +240,17 @@ test('callText：拼接 text-delta，finish=error 抛错', async () => {
     { type: 'text-delta', text: ':"x"}' },
     { type: 'finish', reason: { kind: 'stop' } },
   ]
-  const ctx = { llm: { stream: () => (async function* () { yield* chunks })() } }
+  const ctx = llmCtx(() => (async function* () { yield* chunks })())
   assert.equal(await callText(ctx, { provider: 'p', model: 'm', system: 's', prompt: 'u' }), '{"journal":"x"}')
 
-  const bad = { llm: { stream: () => (async function* () { yield { type: 'finish', reason: { kind: 'error' } } })() } }
+  const bad = llmCtx(() => (async function* () { yield { type: 'finish', reason: { kind: 'error' } } })())
   await assert.rejects(() => callText(bad, { provider: 'p', model: 'm', system: 's', prompt: 'u' }), /未正常完成/)
 })
 
 test('callText：把超时 signal 传给 provider（挂住时能自己退出）', async () => {
   let seen = null
   const ctx = {
-    llm: {
+    get: (name) => (name === 'llm' ? {
       stream: (options) => {
         seen = options.signal
         return (async function* () {
@@ -186,14 +258,14 @@ test('callText：把超时 signal 传给 provider（挂住时能自己退出）'
           yield { type: 'finish', reason: { kind: 'stop' } }
         })()
       },
-    },
+    } : undefined),
   }
   await callText(ctx, { provider: 'p', model: 'm', system: 's', prompt: 'u', timeoutMs: 50 })
   assert.ok(seen instanceof AbortSignal, 'provider 应收到 AbortSignal')
 
   // 流不结束 → 超时后 abort 生效，调用方拿到 rejected 而不是永久挂起
   const hanging = {
-    llm: {
+    get: (name) => (name === 'llm' ? {
       stream: (options) => (async function* () {
         await new Promise((resolve) => {
           if (options.signal.aborted) return resolve()
@@ -202,7 +274,7 @@ test('callText：把超时 signal 传给 provider（挂住时能自己退出）'
         // 已中止：抛错让 for await 终止，模拟真实 provider 的行为
         throw new Error('aborted')
       })(),
-    },
+    } : undefined),
   }
   await assert.rejects(() => callText(hanging, { provider: 'p', model: 'm', system: 's', prompt: 'u', timeoutMs: 30 }))
 })
@@ -210,7 +282,7 @@ test('callText：把超时 signal 传给 provider（挂住时能自己退出）'
 test('callText：调用方 signal 也能中断', async () => {
   const controller = new AbortController()
   const ctx = {
-    llm: {
+    get: (name) => (name === 'llm' ? {
       stream: (options) => (async function* () {
         controller.abort()
         await new Promise((resolve) => {
@@ -219,19 +291,19 @@ test('callText：调用方 signal 也能中断', async () => {
         })
         throw new Error('aborted')
       })(),
-    },
+    } : undefined),
   }
   await assert.rejects(() => callText(ctx, { provider: 'p', model: 'm', system: 's', prompt: 'u', signal: controller.signal }))
 })
 
 test('callText：正常结束时会清掉超时定时器（不留悬挂句柄）', async () => {
   const ctx = {
-    llm: {
+    get: (name) => (name === 'llm' ? {
       stream: () => (async function* () {
         yield { type: 'text-delta', text: 'done' }
         yield { type: 'finish', reason: { kind: 'stop' } }
       })(),
-    },
+    } : undefined),
   }
   // 给一个很长的超时：若定时器没被清理，进程会被它拖住
   assert.equal(await callText(ctx, { provider: 'p', model: 'm', system: 's', prompt: 'u', timeoutMs: 60_000 }), 'done')
@@ -248,12 +320,12 @@ test('runReview：写日志 + 应用 updates + 留痕；短对话跳过', async 
     ],
   })
   const ctx = {
-    llm: {
+    get: (name) => (name === 'llm' ? {
       stream: () => (async function* () {
         yield { type: 'text-delta', text: reply }
         yield { type: 'finish', reason: { kind: 'stop' } }
       })(),
-    },
+    } : undefined),
   }
 
   const result = await runReview({ ctx, dir, session: { events }, provider: 'p', model: 'm', now: new Date(2026, 8, 9, 10, 0) })
@@ -272,12 +344,12 @@ test('runReview：解析失败时通过 onWarn 报出，不再静默', async () 
   const dir = makeDir()
   const events = [{ type: 'user/message', data: { content: [{ type: 'text', text: 'x'.repeat(200) }] } }]
   const ctx = {
-    llm: {
+    get: (name) => (name === 'llm' ? {
       stream: () => (async function* () {
         yield { type: 'text-delta', text: '抱歉，我无法输出 JSON' }
         yield { type: 'finish', reason: { kind: 'stop' } }
       })(),
-    },
+    } : undefined),
   }
   const warnings = []
   const result = await runReview({
@@ -309,12 +381,12 @@ test('runReview：中间一条 update 失败不影响后续 update', async () =>
     ],
   })
   const ctx = {
-    llm: {
+    get: (name) => (name === 'llm' ? {
       stream: () => (async function* () {
         yield { type: 'text-delta', text: reply }
         yield { type: 'finish', reason: { kind: 'stop' } }
       })(),
-    },
+    } : undefined),
   }
   const result = await runReview({ ctx, dir, session: { events }, provider: 'p', model: 'm', now: new Date(2026, 8, 9, 10, 0) })
   assert.ok(readFileSync(join(dir, 'MEMORY.md'), 'utf8').includes('第一条'))

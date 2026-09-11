@@ -3,7 +3,8 @@
  *
  * - 日期过滤 = 直接按文件名（`YYYY-MM-DD.md`）算区间，不建索引；
  * - 关键词 = 全文逐行子串匹配（大小写不敏感），返回命中行 + 上下文；
- * - 不带 query 时返回最近几天的「索引」（每段 `## HH:MM` + 首句）。
+ * - 不带 query 时返回最近几天的「索引」（每段 `## HH:MM` + 首行）。
+ *   首行取该段第一个非标题行——约定日志正文以「> 摘要：…」开头，所以索引展示的就是摘要。
  *
  * 工具名带 `preset_md_` 前缀，避免与官方/第三方工具冲突。
  */
@@ -14,6 +15,15 @@ export const SEARCH_TOOL_NAME = 'preset_md_search'
 
 /** 单次最多返回的命中片段数。 */
 export const MAX_HITS = 30
+
+/** 索引行截断长度；超长补省略号，让模型知道这不是全文。 */
+export const INDEX_CLIP_CHARS = 80
+
+/** 按字符数截断一行文本；被截断时补省略号，让模型知道这不是全文。 */
+export function clip(text, max = INDEX_CLIP_CHARS) {
+  const line = String(text || '')
+  return line.length > max ? `${line.slice(0, max)}…` : line
+}
 
 /**
  * 在日志里检索。
@@ -37,7 +47,7 @@ export function searchJournal(dir, query, days = 7) {
         const head = (lines.find((line) => line.startsWith('## ')) || '').trim()
         if (!head) continue
         const first = (lines.find((line) => line.trim() && !line.startsWith('#')) || '').trim()
-        out.push(`- ${head}${first ? ` ${first.slice(0, 80)}` : ''}`)
+        out.push(`- ${head}${first ? ` ${clip(first, 80)}` : ''}`)
       }
     }
     return out.join('\n')
@@ -66,7 +76,8 @@ export function createSearchTool(dir) {
   return {
     name: SEARCH_TOOL_NAME,
     description:
-      '在助手的记忆日志（memory/YYYY-MM-DD.md）里检索。带 query 时按关键词找原文片段，不带 query 时返回最近几个日志文件的索引。用来回忆过去聊过什么、当时结论是什么。',
+      '在助手的记忆日志（memory/YYYY-MM-DD.md）里检索。带 query 时按关键词找原文片段，' +
+      '不带 query 时返回最近几个日志文件的索引（每段时间标题 + 摘要行）。用来回忆过去聊过什么、当时结论是什么。',
     // parameters 必须是标准 JSON Schema：register() 会原样透传给 provider，
     // 扁平写法（{query:{...}}）会被判非法。
     parameters: {

@@ -102,6 +102,40 @@ export function sessionKeyOf(input) {
   return typeof id === 'string' && id.length > 0 ? id : ''
 }
 
+/**
+ * 读取会话事件列表。
+ *
+ * dsh 的 `Session` 类**不暴露 `events` 属性**（事件日志是私有字段，公开读取方法是
+ * `snapshotEvents(fromSeq?, toSeqExclusive?)` 与 `ownEvents()`）。
+ * 直接读 `session.events` 永远得到 `undefined`：转写恒为空，
+ * 回顾每次都判定 `turn_too_short` 跳过，自动日记永远写不出来。
+ *
+ * 取用顺序：`snapshotEvents()`（全量，含 fork 继承前缀）→ `events` 数组兜底
+ * （兼容假 ctx / 旧形态）→ `ownEvents()`（只含本会话自己的事件）。
+ * 任何一步失败都静默落到下一档，最终返回空数组而不是抛错。
+ */
+export function sessionEvents(session) {
+  if (!session || typeof session !== 'object') return []
+  try {
+    if (typeof session.snapshotEvents === 'function') {
+      const events = session.snapshotEvents()
+      if (Array.isArray(events)) return events
+    }
+  } catch {
+    /* 落到兜底 */
+  }
+  if (Array.isArray(session.events)) return session.events
+  try {
+    if (typeof session.ownEvents === 'function') {
+      const events = session.ownEvents()
+      if (Array.isArray(events)) return events
+    }
+  } catch {
+    /* 无事件可取 */
+  }
+  return []
+}
+
 /** 会话级文本缓存：首次取值后冻结，直到显式清理。 */
 export function createSessionFreeze() {
   const cache = new Map()
@@ -304,18 +338,25 @@ export function substitutePlaceholders(text, facts) {
  * 文件清单、目录、截断策略全部硬编码；只有 tools 是配置项。
  *
  * @param {object} ctx - dsh 上下文（需要 systemPrompt；可选 effect / logger）。
- * @param {{freeze?: boolean, complete?: boolean, variable?: string, sectionName?: string, order?: number}} [options]
- * @returns {{dir: string, files: Array<object>, cache: object, freeze: boolean, variable: string, sectionName: string, order: number, complete: boolean}}
+ * @param {{freeze?: boolean, complete?: boolean, variable?: string, sectionName?: string, order?: number, budgetChars?: number, budgetNotice?: boolean, getSettings?: () => object, onRender?: (settings: object) => void}} [options]
+ * @returns {{dir: string, files: Array<object>, cache: object, freeze: boolean, variable: string, sectionName: string, order: number, complete: boolean, getSettings: () => object, registerSection: (complete: boolean) => () => void, sectionDisposer: () => void}}
  */
 export function registerPrompt(ctx, options = {}) {
   const dir = resolvePresetDir(ctx)
-  const freeze = options.freeze !== false
   const variable = options.variable ?? PROMPT_VARIABLE
   const sectionName = options.sectionName ?? PROMPT_SECTION
   const order = Number.isFinite(options.order) ? options.order : PROMPT_ORDER
-  const complete = options.complete === true
-  const budgetChars = Number.isFinite(options.budgetChars) && options.budgetChars > 0 ? options.budgetChars : DEFAULT_CONTEXT_BUDGET
-  const budgetNotice = options.budgetNotice !== false
+  // 实时读取设置：调用方可传入 getSettings，让 freeze / contextBudget / budgetNotice
+  // 在每次渲染时取最新值（参数改动无需重启或新开会话即可生效）。
+  // 未提供时回退到 options 上的静态值（保持旧的调用方式与单测兼容）。
+  const getSettings = typeof options.getSettings === 'function'
+    ? options.getSettings
+    : () => ({
+        freeze: options.freeze,
+        complete: options.complete,
+        contextBudget: options.budgetChars,
+        budgetNotice: options.budgetNotice,
+      })
   const cache = createSessionFreeze()
 
   /**
@@ -332,8 +373,51 @@ export function registerPrompt(ctx, options = {}) {
     return `__no_session__:${facts.cwd || '-'}:${facts.presetDir || '-'}`
   }
 
+  /**
+   * 注册 section（文本只引用变量：MD 正文里的 {{…}} 不会被插值解析）。
+   * complete 是结构性参数：切换时必须先 dispose 旧 section 再注册新的，
+   * 否则同名 section 重复注册会抛错。返回 disposer，供 read() 重建。
+   */
+  const registerSection = (complete) => {
+    const section = { name: sectionName, order, text: `{{${variable}}}` }
+    if (complete === true) section.complete = true
+    if (typeof ctx.effect === 'function') {
+      return ctx.effect(() => ctx.systemPrompt.section(section), `preset-md.section(${sectionName})`)
+    }
+    return ctx.systemPrompt.section(section)
+  }
+
+  const initial = getSettings() || {}
+  const initialComplete = initial.complete === true
+  const initialFreeze = initial.freeze !== false
+  const initialBudget = Number.isFinite(initial.contextBudget) && initial.contextBudget > 0 ? initial.contextBudget : DEFAULT_CONTEXT_BUDGET
+  const initialBudgetNotice = initial.budgetNotice !== false
+
+  // 当前生效的 section 及其 disposer：complete 变化时由 read() 撤旧建新
+  let currentComplete = initialComplete
+  let sectionDisposer = registerSection(initialComplete)
+
   const read = (context) => {
     if (!dir) return ''
+    const s = getSettings() || {}
+    // 每次渲染实时通知设置快照，让调用方能按需重建结构性参数（complete 等）
+    if (typeof options.onRender === 'function') options.onRender(s)
+    // complete 是结构性参数：设置变化时必须「先撤旧、再注册新」。
+    // 同名 section 在同一 scope 重复注册会直接抛错，不能只注册不撤销。
+    // 变量 provider 在 assemble 中先于 section 收集执行，所以这里重建能在本步生效。
+    const wantComplete = s.complete === true
+    if (wantComplete !== currentComplete) {
+      try {
+        sectionDisposer?.()
+        sectionDisposer = registerSection(wantComplete)
+        currentComplete = wantComplete
+      } catch {
+        /* 重建失败就保持旧 section，不让提示词组装整个挂掉 */
+      }
+    }
+    const freeze = s.freeze !== false
+    const budgetChars = Number.isFinite(s.contextBudget) && s.contextBudget > 0 ? s.contextBudget : DEFAULT_CONTEXT_BUDGET
+    const budgetNotice = s.budgetNotice !== false
     const produce = () => {
       const body = substitutePlaceholders(readAggregateText(dir), contextFacts(context, dir))
       // 整体超预算时追加一段「请收敛」提示；超限判断发生在替换之后，
@@ -348,21 +432,27 @@ export function registerPrompt(ctx, options = {}) {
   }
   ctx.systemPrompt.variable(variable, read)
 
-  // section 文本只引用变量：MD 正文里的 {{…}} 不会被插值解析。
-  const section = { name: sectionName, order, text: `{{${variable}}}` }
-  if (complete) section.complete = true
-  if (typeof ctx.effect === 'function') {
-    ctx.effect(() => ctx.systemPrompt.section(section), `preset-md.section(${sectionName})`)
-  } else {
-    ctx.systemPrompt.section(section)
-  }
-
   const files = DEFAULT_FILES.map((file) => {
     const filePath = dir ? join(dir, file) : ''
     return { file, filePath, exists: filePath ? existsSync(filePath) : false }
   })
 
-  return { dir, files, cache, freeze, variable, sectionName, order, complete, budgetChars, budgetNotice, cacheKeyOf }
+  return {
+    dir,
+    files,
+    cache,
+    freeze: initialFreeze,
+    variable,
+    sectionName,
+    order,
+    complete: initialComplete,
+    budgetChars: initialBudget,
+    budgetNotice: initialBudgetNotice,
+    cacheKeyOf,
+    getSettings,
+    registerSection,
+    sectionDisposer,
+  }
 }
 
 /**
@@ -402,12 +492,48 @@ export function applyToolRestriction(ctx, tools) {
     return { applied: false, reason: 'ctx.tools.restrict 不可用' }
   }
 
+  const scope = ctx?.agent
+  const errors = []
   let known = []
+
+  /**
+   * 首选 `view(scope).restrictableNames`：它正是 `restrict()` 用来校验名单的那份
+   * 集合，且**不做 schema 投影**。dsh 0.1.5-rc.2 起 `schemas()` 在非 native 呈现
+   * 模式（进程设了 `DSH_TOOLS_MODE=both|ptc`）下会先 `requireCodeRuntime(mode)`，
+   * 缺 `codeRuntime` 就整份名单读不出来，`deny` 随之静默失效。
+   */
   try {
-    const schemas = typeof registry.schemas === 'function' ? registry.schemas(ctx.agent) : []
-    known = [...new Set((schemas ?? []).map((schema) => schema?.name).filter(Boolean))]
-  } catch {
-    return { applied: false, reason: '读取可见工具名单失败，无法展开模式' }
+    const names = registry.view?.(scope)?.restrictableNames
+    if (names) known = [...names].filter((name) => typeof name === 'string')
+  } catch (error) {
+    errors.push('view: ' + (error instanceof Error ? error.message : String(error)))
+  }
+
+  /* 兜底：老版本没有 view() 时仍走 schemas()。 */
+  if (known.length === 0) {
+    try {
+      const schemas = typeof registry.schemas === 'function' ? registry.schemas(scope) : []
+      known = [...new Set((schemas ?? []).map((schema) => schema?.name).filter(Boolean))]
+    } catch (error) {
+      errors.push('schemas: ' + (error instanceof Error ? error.message : String(error)))
+    }
+  }
+
+  if (known.length === 0) {
+    /*
+     * 名单为空有两种成因，报错必须分开：真读不到（异常）才叫失败；读到了但一条
+     * 都没有，说明装配期本来就没有全局工具，收窄无从下手——那不是故障。
+     */
+    if (errors.length === 0) {
+      return { applied: false, reason: '当前没有可见工具，模式无需展开' }
+    }
+    return {
+      applied: false,
+      reason: '读取可见工具名单失败，无法展开模式',
+      error: errors.join(' | '),
+      scopeKind: scope === undefined ? 'undefined' : scope === null ? 'null' : typeof scope,
+      scopeKeys: scope && typeof scope === 'object' ? Object.keys(scope).slice(0, 24) : [],
+    }
   }
   if (known.length === 0) {
     return { applied: false, reason: '当前没有可见工具，模式无需展开' }

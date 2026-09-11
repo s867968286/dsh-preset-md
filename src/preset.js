@@ -10,6 +10,11 @@
  * 行为参数由 `<dshHome>/preset-md/settings.json` 决定，
  * 可在「设置 → 伙伴设置 → 参数」里改。
  */
+import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
+
 import {
   PLUGIN_NAME,
   PROMPT_ORDER,
@@ -20,6 +25,7 @@ import {
   measureContext,
   normalizeConfig,
   registerPrompt,
+  sessionEvents,
   sessionKeyOf,
 } from './core.js'
 import { readSettings, resolvePaths } from './settings.mjs'
@@ -33,10 +39,89 @@ const REVIEW_DEBOUNCE_MS = 5000
 /** running 标志的最长有效期（毫秒）；超过即视为卡死并强制解锁。 */
 const RUNNING_STALE_MS = 5 * 60 * 1000
 
+/** 同一条会话的「失败提示」最短重复间隔（毫秒）：失败要看得见，但不能刷屏。 */
+const NOTICE_THROTTLE_MS = 60 * 1000
+
+/** 日志文件上限（字节）：超过就只保留后半，避免无限增长。 */
+const LOG_MAX_BYTES = 256 * 1024
+
+/**
+ * 带本地时区偏移的 ISO 时间戳，例如 `2026-09-11T20:03:31.650+08:00`。
+ *
+ * 不用 `toISOString()`：那给的是 UTC（`…T12:03:31.650Z`），跟日记段落、changelog
+ * 里的本地时间对不上，看日志还得自己心算时差。
+ */
+export function localTimestamp(now = new Date()) {
+  const pad = (value, width = 2) => String(value).padStart(width, '0')
+  const offsetMinutes = -now.getTimezoneOffset()
+  const sign = offsetMinutes >= 0 ? '+' : '-'
+  const abs = Math.abs(offsetMinutes)
+  const offset = `${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`
+  return (
+    `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}` +
+    `T${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}.${pad(now.getMilliseconds(), 3)}${offset}`
+  )
+}
+
+/**
+ * 包一层 logger：既走 dsh 原生日志，也**落盘**到 `<dshHome>/preset-md/preset-md.log`。
+ *
+ * 落盘的理由很实际：dsh 以无控制台的方式启动时 stdout 完全看不到，
+ * 而后台回顾的成败只打日志——出问题时用户根本无从得知（这正是此前
+ * 「日记不写、又看不到任何报错」卡住排查的原因）。落盘失败绝不影响主流程。
+ */
+function createLogger(ctx, paths) {
+  const base = ctx.logger ?? console
+  const file = join(paths.dshHome, 'preset-md', 'preset-md.log')
+  const write = (level, message) => {
+    try {
+      mkdirSync(dirname(file), { recursive: true })
+      try {
+        if (statSync(file).size > LOG_MAX_BYTES) {
+          const prev = readFileSync(file, 'utf8')
+          writeFileSync(file, prev.slice(Math.floor(prev.length / 2)), 'utf8')
+        }
+      } catch {
+        /* 文件还不存在 */
+      }
+      // 落盘时剥掉 `[preset-md]` 前缀：整个文件都属于本插件，前缀纯属噪音。
+      // stdout 那边保留前缀，因为 dsh 的日志里混着别的插件。
+      const line = String(message).replace(/^\[preset-md\]\s*/, '')
+      appendFileSync(file, `${localTimestamp()} [${level}] ${line}\n`, 'utf8')
+    } catch {
+      /* 落盘失败不影响功能 */
+    }
+  }
+  const call = (fn, message) => {
+    try {
+      fn?.(message)
+    } catch {
+      /* 底层日志失败不影响功能 */
+    }
+  }
+  return {
+    info: (message) => {
+      call(base.info?.bind(base), message)
+      write('info', message)
+    },
+    warn: (message) => {
+      call(base.warn?.bind(base), message)
+      write('warn', message)
+    },
+  }
+}
+
 /** Cordis 插件名。 */
 export const name = PLUGIN_NAME
 
-/** 硬依赖：提示词注册表与工具注册表。 */
+/**
+ * 硬依赖：提示词注册表与工具注册表。
+ *
+ * 注意 `llm` **不在这里声明**：preset 组合里存在 isolate 组，
+ * `ctx.llm` 这种属性访问会撞上隔离边界而抛 `cannot get property "llm" without inject`；
+ * 往 inject 里加也不能修好——属性解析顺序是「先查本 fiber 的 store，再查本 fiber 的 inject」，
+ * 声明之后反而更早抛错。所以回顾调用统一走 `ctx.get('llm')`，见 review.mjs 的 callText。
+ */
 export const inject = ['systemPrompt', 'tools']
 
 /** 统计一段 content 的文本长度。 */
@@ -58,38 +143,36 @@ function transcriptChars(events) {
   return total
 }
 
+/** 当前会话累计转写字符数（走 Session 的公开事件读取 API）。 */
+function transcriptCharsOf(agent) {
+  return transcriptChars(sessionEvents(agent?.session))
+}
+
 /**
- * 装配：提示词 → 运行时上下文抑制 → 工具收窄 → 检索工具 → 自动记忆。
+ * 装配：提示词 → 工具收窄 → 检索工具 → 自动记忆。
  * @param {object} ctx - dsh 上下文。
  * @param {unknown} rawConfig - preset 行的 config（目前只认 tools）。
  */
 export function apply(ctx, rawConfig) {
   const config = normalizeConfig(rawConfig)
-  const logger = ctx.logger ?? console
-  const settings = readSettings(resolvePaths())
+  const paths = resolvePaths()
+  // dsh 无控制台启动时 stdout 看不到，所有日志同时落盘（见 createLogger）
+  const logger = createLogger(ctx, paths)
+
+  /*
+   * 参数实时生效：设置**每次使用**时才读盘，而不是在 apply 时读一次就冻结。
+   * 这样在「伙伴设置 → 参数」里改完立即对新会话与运行中的会话都生效，
+   * 不必重启 dsh、也不必重开会话。
+   */
+  const getSettings = () => readSettings(paths)
 
   /* 提示词：变量承载内容 + 唯一 section（可 complete）+ 会话冻结 */
   const prompt = registerPrompt(ctx, {
-    freeze: settings.freeze,
-    complete: settings.complete,
     variable: PROMPT_VARIABLE,
     sectionName: PROMPT_SECTION,
     order: PROMPT_ORDER,
-    budgetChars: settings.contextBudget,
-    budgetNotice: settings.budgetNotice,
+    getSettings,
   })
-
-  /* 抑制本 scope 的全部运行时上下文快照 */
-  if (settings.suppressRuntimeContext) {
-    try {
-      ctx.systemPrompt?.suppressRuntimeContext?.()
-      logger.info?.('[preset-md] 已抑制本 scope 的全部运行时上下文快照')
-    } catch (error) {
-      logger.warn?.(
-        `[preset-md] 抑制运行时上下文失败（不影响其余功能）：${error instanceof Error ? error.message : String(error)}`,
-      )
-    }
-  }
 
   /* 工具收窄：把模式展开成精确名单后交给 tools.restrict */
   if (config.tools.allow.length > 0 || config.tools.deny.length > 0) {
@@ -100,7 +183,17 @@ export function apply(ctx, rawConfig) {
       if (result.filter?.deny?.length) bits.push(`deny=${result.filter.deny.join(',')}`)
       logger.info?.(`[preset-md] 工具收窄已生效：${bits.join(' ')}`)
     } else if (result.reason) {
-      logger.warn?.(`[preset-md] 工具收窄未生效：${result.reason}`)
+      /*
+       * 把真实异常一并打出来：早先只写 reason 的固定文案，升级到 dsh 0.1.5-rc.2 后
+       * 这条 warn 连刷十几次都看不出根因（schemas() 为什么抛错），只能靠读 dsh 源码猜。
+       * scope 形态（ctx.agent 是 undefined 还是对象）决定了是「没有 agent scope」
+       * 还是「某个工具的 schema 无法投影」，两者修法完全不同。
+       */
+      const detail = []
+      if (result.error) detail.push(`错误=${result.error}`)
+      if (result.scopeKind) detail.push(`ctx.agent=${result.scopeKind}`)
+      if (result.scopeKeys?.length) detail.push(`agent键=[${result.scopeKeys.join(',')}]`)
+      logger.warn?.(`[preset-md] 工具收窄未生效：${result.reason}${detail.length > 0 ? ' | ' + detail.join(' | ') : ''}`)
     }
     if (result.unmatched?.length) {
       logger.warn?.(`[preset-md] 以下工具模式未匹配到任何可见工具：${result.unmatched.join(', ')}`)
@@ -114,16 +207,24 @@ export function apply(ctx, rawConfig) {
     )
     return
   }
-  logger.info?.(`[preset-md] 预设目录 = ${prompt.dir}`)
+  /*
+   * 装配信息合并成一条：早先每样打一行（目录 / 参数 / section / 六个文件各一行），
+   * 每次重启就刷 10 行噪音，真正要看的「回顾成败」反而被埋掉。
+   * 现在只留一行，缺文件单独点名（全都在就只列名字）。
+   */
+  const startup = getSettings()
+  const present = prompt.files.filter((item) => item.exists).map((item) => item.file.replace(/\.md$/, ''))
+  const missing = prompt.files.filter((item) => !item.exists).map((item) => item.file)
   logger.info?.(
-    `[preset-md] section ${prompt.sectionName} (order ${prompt.order}, complete=${prompt.complete}, 冻结=${prompt.freeze}, 变量 {{${prompt.variable}}})`,
+    `[preset-md] 装配 目录=${prompt.dir} | 参数 autoMemory=${startup.autoMemory} ` +
+      `reviewTurns=${startup.reviewTurns} reviewChars=${startup.reviewChars} ` +
+      `freeze=${startup.freeze} complete=${startup.complete} | ` +
+      `section=${prompt.sectionName}(order ${prompt.order}, 变量 {{${prompt.variable}}}) | ` +
+      `文件=${present.join('/') || '（无）'}${missing.length > 0 ? ` 缺:${missing.join(',')}` : ''}`,
   )
-  for (const item of prompt.files) {
-    logger.info?.(`[preset-md] ${item.exists ? '✓' : '·'} ${item.file}`)
-  }
 
   /* 注入体积：整体预算与各文件占比，一次量清 */
-  logContextUsage(prompt.dir, settings, logger)
+  logContextUsage(prompt.dir, getSettings(), logger)
 
   /* 记忆工具：读（检索历史日志）+ 写（日志 / 长期记忆） */
   if (typeof ctx.tools?.register === 'function') {
@@ -132,23 +233,22 @@ export function apply(ctx, rawConfig) {
       [createJournalTool, 'preset_md_journal'],
       [createMemoryTool, 'preset_md_memory'],
     ]
-    const ok = []
     for (const [factory, toolName] of toolFactories) {
       try {
         ctx.tools.register(factory(prompt.dir))
-        ok.push(toolName)
       } catch (error) {
+        // 成功不打日志：三个工具每次都一样，写进去只是噪音；失败才值得说。
         logger.warn?.(
           `[preset-md] ${toolName} 注册失败（不影响其余功能）：${error instanceof Error ? error.message : String(error)}`,
         )
       }
     }
-    if (ok.length > 0) logger.info?.(`[preset-md] 已注册记忆工具：${ok.join(', ')}`)
   }
 
-  if (settings.autoMemory) registerAutoMemory(ctx, prompt, settings, logger)
+  // 始终挂上自动记忆：开关改为在每次触发时实时判断，
+  // 这样「关掉自动记忆」对运行中的会话也立即生效（不必等新会话）。
+  registerAutoMemory(ctx, prompt, getSettings, logger)
 }
-
 /**
  * 量一遍注入体积并打日志。
  *
@@ -176,24 +276,83 @@ function logContextUsage(dir, settings, logger) {
 }
 
 /**
- * 自动记忆：回合结束按阈值触发，会话结束必触发；全部后台异步，不阻塞主对话。
+ * 会话键缩写：日志里带上它，才能分辨「哪个会话触发的回顾」。
+ * 多个会话共用一个 preset（standing 组合是共享的），光看时间无法区分。
  */
-function registerAutoMemory(ctx, prompt, settings, logger) {
-  /** sessionKey -> { turns, markChars, lastAt, running, runningSince, pending } */
+function shortKey(key) {
+  const text = String(key ?? '')
+  return text.length > 12 ? `${text.slice(0, 12)}…` : text || '?'
+}
+
+/**
+ * 自动记忆：回合结束按阈值触发，会话结束必触发；全部后台异步，不阻塞主对话。
+ *
+ * 设置全部实时读取（getSettings），所以阈值、开关改动立即生效。
+ * 触发条件满足却没能写入时，除了打日志，还会**往对话里注入一条提示**——
+ * 失败发生在后台，日志又只在 dsh 进程的 stdout，用户默认看不到。
+ */
+function registerAutoMemory(ctx, prompt, getSettings, logger) {
+  /** sessionKey -> { turns, markChars, lastAt, running, runningSince, pending, lastNoticeAt } */
   const states = new Map()
 
   const stateOf = (key) => {
     let state = states.get(key)
     if (!state) {
-      state = { turns: 0, markChars: 0, lastAt: 0, running: false, runningSince: 0, pending: '' }
+      state = { turns: 0, markChars: 0, lastAt: 0, running: false, runningSince: 0, pending: '', lastNoticeAt: 0 }
       states.set(key, state)
     }
     return state
   }
 
-  const resolveModel = () => {
-    const selection = ctx.get?.('agentDefaultModel')?.currentSelection?.()
-    return selection?.provider && selection?.model ? { provider: selection.provider, model: selection.model } : null
+  /**
+   * 取本次回顾要用的模型：**直接用当前会话正在用的模型**。
+   *
+   * `session.requestHeader().config` 就是会话日志里最后一条 request/header 的
+   * provider/model——也就是这个会话实际跑着的模型。不再用全局默认模型
+   * （`agentDefaultModel`），否则会话换过模型时，回顾会跑到另一个模型上去。
+   *
+   * 会话还没有任何请求头时（极端情况）才回退到全局默认。
+   */
+  const resolveModel = (agent) => {
+    try {
+      const config = agent?.session?.requestHeader?.()?.config
+      if (config?.provider && config?.model) {
+        return { provider: String(config.provider), model: String(config.model) }
+      }
+    } catch {
+      /* 落到回退 */
+    }
+    try {
+      const selection = ctx.get?.('agentDefaultModel')?.currentSelection?.()
+      if (selection?.provider && selection?.model) {
+        return { provider: String(selection.provider), model: String(selection.model) }
+      }
+    } catch {
+      /* 没有可用模型 */
+    }
+    return null
+  }
+
+  /**
+   * 把一条失败提示送进对话（模型可见），带节流，避免同一问题反复刷屏。
+   * 注入走 agent.inject，与官方 approval 通知同一路子。
+   */
+  const notify = (agent, key, text) => {
+    const state = stateOf(key)
+    const now = Date.now()
+    if (now - state.lastNoticeAt < NOTICE_THROTTLE_MS) return
+    state.lastNoticeAt = now
+    const message = `[preset-md] ${text}`
+    try {
+      agent?.inject?.(
+        createUserMessage({
+          content: [{ type: 'text', text: message }],
+          source: { kind: 'plugin', plugin: 'dsh-preset-md' },
+        }),
+      )
+    } catch (error) {
+      logger.warn?.(`[preset-md] 失败提示未能注入对话：${error instanceof Error ? error.message : String(error)}`)
+    }
   }
 
   /**
@@ -224,13 +383,17 @@ function registerAutoMemory(ctx, prompt, settings, logger) {
     state.running = true
     state.runningSince = now
     state.turns = 0
-    state.markChars = transcriptChars(agent?.session?.events)
+    state.markChars = transcriptCharsOf(agent)
 
     void (async () => {
       try {
-        const model = resolveModel()
+        // 实时读设置：阈值可能与触发时不同了，用最新值决定转写窗口
+        const settings = getSettings()
+        const model = resolveModel(agent)
         if (!model) {
-          logger.warn?.('[preset-md] 自动记忆跳过：拿不到默认模型（agentDefaultModel）')
+          const detail = '拿不到会话模型与默认模型，本次未执行'
+          logger.warn?.(`[preset-md] 自动记忆跳过：${detail}`)
+          notify(agent, key, `自动记忆已满足触发条件（${reason}），但${detail}。`)
           return
         }
         const result = await runReview({
@@ -243,10 +406,35 @@ function registerAutoMemory(ctx, prompt, settings, logger) {
           transcriptChars: settings.reviewChars,
           onWarn: (message) => logger.warn?.(`[preset-md] ${message}`),
         })
-        if (result.skipped) logger.info?.(`[preset-md] 自动记忆跳过（${result.skipped}，触发=${reason}）`)
-        else logger.info?.(`[preset-md] 自动记忆完成（触发=${reason}）：${(result.applied ?? []).join(', ') || '无改动'}`)
+        if (result.skipped) {
+          // 正常跳过（例如对话太短），只在日志里留痕，不打扰用户
+          logger.info?.(`[preset-md] 自动记忆跳过（${result.skipped}，触发=${reason}，会话=${shortKey(key)}）`)
+        } else if (result.parseFailed) {
+          const detail = '模型输出解析失败，本轮日记与记忆都没写入'
+          logger.warn?.(
+            `[preset-md] 自动记忆已触发（${reason}，会话=${shortKey(key)}）但${detail}。原文片段：${result.parseFailed}`,
+          )
+          notify(agent, key, `自动记忆已满足触发条件（${reason}），但${detail}。`)
+        } else {
+          const applied = (result.applied ?? []).join(', ')
+          if (applied) {
+            logger.info?.(`[preset-md] 自动记忆完成（触发=${reason}，会话=${shortKey(key)}）：${applied}`)
+          } else if (result.journalEmpty) {
+            // 不一律告警：按规则，寒暄/简单问答/测试本来就该留空，那是正常结果。
+            // 这里记 info 并带上转写长度，长度能帮人判断这个「空」是否合理。
+            const length = Number.isFinite(result.transcriptLength) ? result.transcriptLength : -1
+            logger.info?.(
+              `[preset-md] 自动记忆完成（触发=${reason}，会话=${shortKey(key)}）：本轮未追加日志——` +
+                `模型判定没有值得记录的新内容（转写 ${length} 字符；若本轮确实只是寒暄 / 简单问答 / 测试则属正常）`,
+            )
+          } else {
+            logger.info?.(`[preset-md] 自动记忆完成（触发=${reason}，会话=${shortKey(key)}）：记忆无改动`)
+          }
+        }
       } catch (error) {
-        logger.warn?.(`[preset-md] 自动记忆失败：${error instanceof Error ? error.message : String(error)}`)
+        const detail = error instanceof Error ? error.message : String(error)
+        logger.warn?.(`[preset-md] 自动记忆失败：${detail}`)
+        notify(agent, key, `自动记忆已满足触发条件（${reason}），但执行失败：${detail}`)
       } finally {
         state.running = false
         state.runningSince = 0
@@ -262,9 +450,11 @@ function registerAutoMemory(ctx, prompt, settings, logger) {
     const agent = payload?.agent
     const key = sessionKeyOf(agent)
     if (!key) return
+    const settings = getSettings()
+    if (settings.autoMemory !== true) return
     const state = stateOf(key)
     state.turns += 1
-    const total = transcriptChars(agent?.session?.events)
+    const total = transcriptCharsOf(agent)
     const grown = total - state.markChars
     if (state.turns < settings.reviewTurns && grown < settings.reviewChars) return
     schedule(agent, key, `轮数${state.turns}/新增${grown}字符`)
@@ -274,8 +464,8 @@ function registerAutoMemory(ctx, prompt, settings, logger) {
     const agent = payload?.agent ?? payload
     const key = sessionKeyOf(agent)
     if (!key) return
-    // 会话结束必触发：force 绕过防抖
-    schedule(agent, key, '会话结束', true)
+    // 会话结束必触发：force 绕过防抖。开关关闭时同样不写。
+    if (getSettings().autoMemory === true) schedule(agent, key, '会话结束', true)
     // 提示词缓存按会话键存放，会话结束一并清掉，避免 Map 增长
     prompt.cache.clear(key)
     // 留足时间给可能正在跑的回顾（含补跑），之后才清状态
