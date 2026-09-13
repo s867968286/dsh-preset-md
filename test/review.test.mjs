@@ -9,7 +9,7 @@ import { join } from 'node:path'
 
 import { appendJournal, changelogPath, journalPath } from '../src/memory-store.mjs'
 import { INDEX_CLIP_CHARS, SEARCH_TOOL_NAME, clip, createSearchTool, searchJournal } from '../src/search.mjs'
-import { buildReviewInput, buildTranscript, callText, parseReviewJson, REVIEW_SYSTEM_PROMPT, runReview } from '../src/review.mjs'
+import { buildReviewInput, buildTranscript, callText, isHumanMessage, parseReviewJson, REVIEW_SYSTEM_PROMPT, runReview } from '../src/review.mjs'
 
 const makeDir = () => mkdtempSync(join(tmpdir(), 'preset-md-search-'))
 
@@ -124,20 +124,93 @@ test('createSearchTool：工具名带 preset_md_ 前缀，execute 返回文本',
 
 test('buildTranscript：只取 user/assistant 文本并截断尾部', () => {
   const events = [
-    { type: 'user/message', data: { content: [{ type: 'text', text: '你好' }] } },
+    { type: 'user/message', data: { content: [{ type: 'text', text: '你好' }], source: { kind: 'user' } } },
     { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '在的' }] } } },
     { type: 'tool/result', data: {} },
   ]
   assert.equal(buildTranscript(events), '用户：你好\n\n助手：在的')
-  const long = buildTranscript([{ type: 'user/message', data: { content: [{ type: 'text', text: 'x'.repeat(50) }] } }], 10)
+  const long = buildTranscript([{ type: 'user/message', data: { content: [{ type: 'text', text: 'x'.repeat(50) }], source: { kind: 'user' } } }], 10)
   assert.equal(long.length, 10)
+})
+
+test('buildTranscript / isHumanMessage：只有 source.kind=user 才算真人发言（回归）', () => {
+  /*
+   * 这条锁的是「注入消息被当真人发言」这个缺陷。
+   *
+   * 夹具必须带**真实来源**：`user/message` 不区分来源，真人发言、官方运行时快照、
+   * 其他插件注入、技能目录全部以它落盘。官方 `MessageSourceMap` 是 merge-extensible，
+   * 非真人来源除 `plugin` 外还有 `skill-catalog` / `agent-instructions` /
+   * `subagent-settled` / `agent-message` 等多种独立 kind（真实会话里都出现过），
+   * 所以必须白名单匹配 `=== 'user'`，不能「排除 plugin」。
+   */
+  const snapshot = 'Current runtime context. This snapshot supersedes earlier runtime-context snapshots.'
+  const events = [
+    // 官方运行时快照：也是 user/message，但来源是插件
+    { type: 'user/message', data: {
+      content: [{ type: 'text', text: snapshot }],
+      source: { kind: 'plugin', plugin: '@deepseek-ai/dsh-system-prompt', form: 'snapshot' },
+    } },
+    // 其余几种非 plugin 的非真人来源（都是独立 kind）
+    { type: 'user/message', data: { content: [{ type: 'text', text: '技能目录内容' }], source: { kind: 'skill-catalog', form: 'catalog' } } },
+    { type: 'user/message', data: { content: [{ type: 'text', text: '工作区指令' }], source: { kind: 'agent-instructions', form: 'instructions' } } },
+    { type: 'user/message', data: { content: [{ type: 'text', text: '子代理完成通知' }], source: { kind: 'subagent-settled', form: 'notice' } } },
+    { type: 'user/message', data: { content: [{ type: 'text', text: '另一个代理的消息' }], source: { kind: 'agent-message', form: 'relay' } } },
+    // 真人发言
+    { type: 'user/message', data: { content: [{ type: 'text', text: '真实发言' }], source: { kind: 'user' } } },
+    { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '好的' }] } } },
+  ]
+
+  const text = buildTranscript(events)
+
+  assert.ok(text.includes('真实发言'), '真人发言必须进转写')
+  assert.ok(!text.includes(snapshot), '官方运行时快照不该进转写（否则会自我喂养）')
+  assert.ok(!text.includes('技能目录内容'), 'skill-catalog 不该进转写')
+  assert.ok(!text.includes('工作区指令'), 'agent-instructions 不该进转写')
+  assert.ok(!text.includes('子代理完成通知'), 'subagent-settled 不该进转写')
+  assert.ok(!text.includes('另一个代理的消息'), 'agent-message 不该进转写')
+  assert.ok(text.includes('好的'), '助手发言照常进转写')
+
+  // 判定函数本身：三种非真人 kind 都不能算真人
+  assert.equal(isHumanMessage({ type: 'user/message', data: { source: { kind: 'user' } } }), true)
+  assert.equal(isHumanMessage({ type: 'user/message', data: { source: { kind: 'plugin' } } }), false)
+  assert.equal(isHumanMessage({ type: 'user/message', data: { source: { kind: 'skill-catalog' } } }), false)
+  assert.equal(isHumanMessage({ type: 'user/message', data: {} }), false, '缺 source 不能当真人（官方契约里 source 必填）')
+  assert.equal(isHumanMessage({ type: 'assistant/message', data: { source: { kind: 'user' } } }), false)
+})
+
+test('runReview：注入消息不计入触发阈值（只算真人与助手）', async () => {
+  /*
+   * 阈值必须只由真人发言 + 助手回复撑起。否则注入文本会撑大 grown，
+   * 让回顾在真人几乎没说话时就被触发——真实数据里某个工作区的会话
+   * user/message 字符有 96% 来自注入而非真人。
+   */
+  const dir = makeDir()
+  const events = [
+    // 一大段注入，真人几乎没说话：合计远超 minChars，但不该算进「新增」
+    { type: 'user/message', data: {
+      content: [{ type: 'text', text: 'x'.repeat(5000) }],
+      source: { kind: 'plugin', plugin: '@deepseek-ai/dsh-system-prompt', form: 'snapshot' },
+    } },
+    { type: 'user/message', data: { content: [{ type: 'text', text: '短' }], source: { kind: 'user' } } },
+  ]
+  let seenPrompt = ''
+  const ctx = llmCtx(() => (async function* () {
+    yield { type: 'text-delta', text: '{"journal":"","updates":[]}' }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  })())
+
+  const result = await runReview({ ctx, dir, session: { events }, provider: 'p', model: 'm' })
+  // 只算真人那 1 个字 → 低于 minChars(80) → 跳过，而不是被 5000 字注入骗过门槛
+  assert.equal(result.skipped, 'turn_too_short', '注入文本不该把转写撑过最低门槛')
+
+  rmSync(dir, { recursive: true, force: true })
 })
 
 test('runReview：转写窗口跟随触发阈值，不丢两次回顾之间的内容', async () => {
   const dir = makeDir()
   // 造一段比默认 8000 更长的转写，开头放一个标志词
   const events = [
-    { type: 'user/message', data: { content: [{ type: 'text', text: `开头标志 ${'x'.repeat(9000)}` }] } },
+    { type: 'user/message', data: { content: [{ type: 'text', text: `开头标志 ${'x'.repeat(9000)}` }], source: { kind: 'user' } } },
   ]
   let seenPrompt = ''
   const ctx = {
@@ -209,7 +282,7 @@ test('buildReviewInput：当天已有日志时必须说清「别重复旧的、�
 
 test('runReview：模型没产出日志段落时打上 journalEmpty 标记', async () => {
   const dir = makeDir()
-  const events = [{ type: 'user/message', data: { content: [{ type: 'text', text: 'x'.repeat(200) }] } }]
+  const events = [{ type: 'user/message', data: { content: [{ type: 'text', text: 'x'.repeat(200) }], source: { kind: 'user' } } }]
   const ctx = llmCtx(() => (async function* () {
     yield { type: 'text-delta', text: '{"journal":"","updates":[]}' }
     yield { type: 'finish', reason: { kind: 'stop' } }
@@ -311,7 +384,7 @@ test('callText：正常结束时会清掉超时定时器（不留悬挂句柄）
 
 test('runReview：写日志 + 应用 updates + 留痕；短对话跳过', async () => {
   const dir = makeDir()
-  const events = [{ type: 'user/message', data: { content: [{ type: 'text', text: '讨论插件设计'.repeat(20) }] } }]
+  const events = [{ type: 'user/message', data: { content: [{ type: 'text', text: '讨论插件设计'.repeat(20) }], source: { kind: 'user' } } }]
   const reply = JSON.stringify({
     journal: '### 讨论与解决\n\n聊了插件设计',
     updates: [
@@ -335,14 +408,14 @@ test('runReview：写日志 + 应用 updates + 留痕；短对话跳过', async 
   assert.ok(result.applied.some((line) => line.startsWith('SYSTEM.md:add 失败')))
   assert.ok(readFileSync(changelogPath(dir, 'MEMORY.md'), 'utf8').includes('- op: add'))
 
-  const skipped = await runReview({ ctx, dir, session: { events: [{ type: 'user/message', data: { content: [{ type: 'text', text: 'hi' }] } }] }, provider: 'p', model: 'm' })
+  const skipped = await runReview({ ctx, dir, session: { events: [{ type: 'user/message', data: { content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } } }] }, provider: 'p', model: 'm' })
   assert.equal(skipped.skipped, 'turn_too_short')
   rmSync(dir, { recursive: true, force: true })
 })
 
 test('runReview：解析失败时通过 onWarn 报出，不再静默', async () => {
   const dir = makeDir()
-  const events = [{ type: 'user/message', data: { content: [{ type: 'text', text: 'x'.repeat(200) }] } }]
+  const events = [{ type: 'user/message', data: { content: [{ type: 'text', text: 'x'.repeat(200) }], source: { kind: 'user' } } }]
   const ctx = {
     get: (name) => (name === 'llm' ? {
       stream: () => (async function* () {
@@ -370,7 +443,7 @@ test('runReview：解析失败时通过 onWarn 报出，不再静默', async () 
 
 test('runReview：中间一条 update 失败不影响后续 update', async () => {
   const dir = makeDir()
-  const events = [{ type: 'user/message', data: { content: [{ type: 'text', text: 'x'.repeat(200) }] } }]
+  const events = [{ type: 'user/message', data: { content: [{ type: 'text', text: 'x'.repeat(200) }], source: { kind: 'user' } } }]
   const reply = JSON.stringify({
     journal: '### 讨论与解决\n\n聊了 A',
     updates: [

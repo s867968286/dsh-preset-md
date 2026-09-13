@@ -37,11 +37,30 @@ export const REVIEW_SYSTEM_PROMPT = [
 /** 转写窗口的默认字符数（与默认触发阈值 reviewChars 保持一致）。 */
 export const DEFAULT_TRANSCRIPT_CHARS = 8000
 
+/**
+ * 判断一条事件是不是**真人**发言。
+ *
+ * `user/message` 不区分来源：真人发言、官方运行时快照、其他插件的注入消息
+ * 全部以它落盘，要靠 `Message.source.kind` 区分（官方契约里 `Message.source`
+ * 是**必填**字段，见 `@deepseek-ai/dsh-llm` 的 `Message`）。
+ *
+ * 必须用**严格匹配** `=== 'user'`，而不是「排除 plugin」：
+ * `MessageSourceMap` 是 merge-extensible 的，非真人来源除 `plugin` 外还有
+ * `skill-catalog` / `agent-instructions` / `subagent-settled` / `agent-message`
+ * 等多种独立 kind（真实会话里都实测出现过），宽容放行会把它们漏掉。
+ *
+ * 不过滤的后果是**自我喂养**：运行时快照里含记忆条目的标题与描述，被当成
+ * 用户发言喂给回顾模型后，模型可能据此再写一条重复记忆。
+ */
+export function isHumanMessage(event) {
+  return event?.type === 'user/message' && event.data?.source?.kind === 'user'
+}
+
 /** 把会话事件里的 user/assistant 文本拼成转写（取尾部，超长截断）。 */
 export function buildTranscript(events, maxChars = DEFAULT_TRANSCRIPT_CHARS) {
   const lines = []
   for (const event of Array.isArray(events) ? events : []) {
-    if (event?.type === 'user/message') {
+    if (isHumanMessage(event)) {
       const text = textOf(event.data?.content)
       if (text) lines.push(`用户：${text}`)
     } else if (event?.type === 'assistant/message') {

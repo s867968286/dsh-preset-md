@@ -10,7 +10,9 @@ window.__ModuleLoader__.load({
   factory(require) {
     const React = require('react')
     const h = React.createElement
-    const { Modal, Button, IconBrowseOutline16, IconCopyOutline16, IconTrashOutline16 } = require('@deepseek-ai/dsh-client-ui-primitives')
+    // 不 require 任何官方 UI 包：`@deepseek-ai/dsh-client-ui-primitives` 在当前 DSH
+    // 版本已不存在，顶层解构会抛错，导致 factory 失败 → apply 从不执行 → 整页裸样式。
+    // 组件与图标都在下方自建（Dialog / Icon*），只依赖 react。
     const API = '/preset-md/api'
     const SECTION_ID = 'preset-md'
 
@@ -93,6 +95,13 @@ window.__ModuleLoader__.load({
       '.pmd-sep{height:1px;background:var(--dsw-alias-border-l2,#eee);margin:4px 0}',
       '.pmd-dialog{width:min(480px,100%)}',
       '.pmd-dialog-fields{display:flex;flex-direction:column;gap:12px}',
+      // 自建 Dialog 的定位与层级：原 Modal 自带这些，换成原生元素后必须自己补。
+      '.pmd-overlay{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;padding:24px;background:var(--dsw-alias-bg-mask-drop,rgba(0,0,0,.45))}',
+      '.pmd-dialog-sheet{width:min(560px,100%);max-height:min(80vh,720px);box-sizing:border-box;display:flex;flex-direction:column;gap:10px;padding:16px 18px;border-radius:14px;border:.5px solid var(--dsw-alias-border-l2,#e5e5e5);background:var(--dsw-alias-bg-overlay,#fff);color:var(--dsw-alias-label-primary,#1f1f1f);box-shadow:0 12px 40px rgba(0,0,0,.18)}',
+      '.pmd-dialog-head{display:flex;flex-direction:column;gap:2px}',
+      '.pmd-dialog-title{font-size:15px;font-weight:600;line-height:1.4;overflow-wrap:anywhere}',
+      '.pmd-dialog-sub{font-size:11.5px;color:var(--dsw-alias-label-tertiary,#8c8c8c)}',
+      '.pmd-dialog-foot{display:flex;justify-content:flex-end;gap:8px}',
     ].join('\n')
 
     function ensureStyles() {
@@ -103,6 +112,50 @@ window.__ModuleLoader__.load({
       style.textContent = CSS
       document.head.appendChild(style)
     }
+
+    /**
+     * 自建弹窗。
+     * 不用 @deepseek-ai/dsh-client-ui-primitives —— 该包在此 DSH 版本已不存在。
+     * 属性含义与原 Modal 对齐：title / description / footer / onClose / className。
+     */
+    function Dialog({ open, onClose, title, description, footer, className, children }) {
+      if (!open) return null
+      return h('div', {
+        className: 'pmd-overlay',
+        role: 'dialog',
+        'aria-modal': 'true',
+        'aria-label': title,
+        onClick: onClose,                       // 点遮罩关闭
+      },
+        h('div', {
+          className: `pmd-dialog-sheet ${className || ''}`.trim(),
+          onClick: (event) => event.stopPropagation(),   // 点内容不关闭
+        },
+          h('div', { className: 'pmd-dialog-head' },
+            h('div', { className: 'pmd-dialog-title' }, title),
+            description ? h('div', { className: 'pmd-dialog-sub' }, description) : null,
+          ),
+          children,
+          footer ? h('div', { className: 'pmd-dialog-foot' }, footer) : null,
+        ),
+      )
+    }
+
+    /* ── 内联图标（16×16，stroke 跟随 currentColor，可用 CSS 改色） ── */
+
+    const ICON_PROPS = {
+      width: 16, height: 16, viewBox: '0 0 16 16', fill: 'none',
+      stroke: 'currentColor', strokeWidth: 1.5,
+      strokeLinecap: 'round', strokeLinejoin: 'round',
+    }
+    const IconBrowse = () => h('svg', ICON_PROPS,
+      h('circle', { cx: 7, cy: 7, r: 4.5 }), h('path', { d: 'M10.5 10.5 L14 14' }))
+    const IconCopy = () => h('svg', ICON_PROPS,
+      h('rect', { x: 5.5, y: 5.5, width: 8, height: 8, rx: 1.5 }),
+      h('path', { d: 'M10.5 5.5 V3.5 A1.5 1.5 0 0 0 9 2 H3.5 A1.5 1.5 0 0 0 2 3.5 V9 A1.5 1.5 0 0 0 3.5 10.5 H5.5' }))
+    const IconTrash = () => h('svg', ICON_PROPS,
+      h('path', { d: 'M2.5 4.5 H13.5' }), h('path', { d: 'M6 4.5 V3 A1 1 0 0 1 7 2 H9 A1 1 0 0 1 10 3 V4.5' }),
+      h('path', { d: 'M4 4.5 L4.8 13 A1 1 0 0 0 5.8 14 H10.2 A1 1 0 0 0 11.2 13 L12 4.5' }))
 
     async function call(path, options) {
       const response = await fetch(`${API}${path}`, options)
@@ -307,7 +360,7 @@ window.__ModuleLoader__.load({
         }
       }
 
-      const copyDialog = copyFrom ? h(Modal, {
+      const copyDialog = copyFrom ? h(Dialog, {
         open: true,
         onClose: closeCopy,
         title: '复制伙伴',
@@ -315,8 +368,8 @@ window.__ModuleLoader__.load({
         className: 'pmd-dialog',
         description: `以「${copyFrom.name}」为模板复制一个新伙伴，保留性格与内容，不带历史日记。`,
         footer: h(React.Fragment, null,
-          h(Button, { variant: 'outline', disabled: copying, onClick: closeCopy }, '取消'),
-          h(Button, { disabled: copying || !copyName.trim(), onClick: confirmCopy }, copying ? '复制中…' : '复制')),
+          h('button', { type: 'button', className: 'pmd-btn', disabled: copying, onClick: closeCopy }, '取消'),
+          h('button', { type: 'button', className: 'pmd-btn pmd-btn-primary', disabled: copying || !copyName.trim(), onClick: confirmCopy }, copying ? '复制中…' : '复制')),
       }, h('div', { className: 'pmd-dialog-fields' },
         h('label', { className: 'pmd-field' },
           h('span', { className: 'pmd-field-label' }, '新伙伴昵称'),
@@ -357,14 +410,14 @@ window.__ModuleLoader__.load({
               title: '查看',
               'aria-label': `查看：${agent.name}`,
               onClick: () => onOpen(agent.id),
-            }, h(IconBrowseOutline16)),
+            }, h(IconBrowse)),
             h('button', {
               className: 'pmd-icon-btn',
               type: 'button',
               title: '复制',
               'aria-label': `复制：${agent.name}`,
               onClick: () => openCopy(agent),
-            }, h(IconCopyOutline16)),
+            }, h(IconCopy)),
             h('button', {
               className: 'pmd-icon-btn pmd-icon-btn-danger',
               type: 'button',
@@ -372,7 +425,7 @@ window.__ModuleLoader__.load({
               disabled: deleting === agent.id,
               'aria-label': `删除：${agent.name}`,
               onClick: () => remove(agent),
-            }, h(IconTrashOutline16)))))),
+            }, h(IconTrash)))))),
         copyDialog,
       )
     }
@@ -425,14 +478,14 @@ window.__ModuleLoader__.load({
       const shown = expanded ? rows : rows.slice(0, JOURNAL_VISIBLE_DAYS)
       const hidden = rows.length - shown.length
 
-      const viewer = h(Modal, {
+      const viewer = h(Dialog, {
         open: viewing !== null,
         onClose: () => setViewing(null),
         title: viewing ? `日记 · ${viewing}` : '',
         closeLabel: '关闭',
         className: 'pmd-viewer-dialog',
         description: '这一天的日记内容，只读。',
-        footer: h(Button, { variant: 'outline', autoFocus: true, onClick: () => setViewing(null) }, '关闭'),
+        footer: h('button', { type: 'button', className: 'pmd-btn', autoFocus: true, onClick: () => setViewing(null) }, '关闭'),
       }, h('pre', { className: 'pmd-viewer' }, loading ? '读取中…' : text))
 
       return h('div', { className: 'pmd-journal' },
@@ -560,8 +613,14 @@ window.__ModuleLoader__.load({
     }
 
     function apply(ctx) {
+      // 先插样式：即使后面拿不到 slots，页面至少是带样式的（不是裸 HTML）。
       ensureStyles()
-      const slots = ctx.slots !== undefined ? ctx.slots : ctx.get('slots')
+      // 两种取服务形态：cordis 的 ctx.get(name)，以及直接挂在 ctx 上的属性。
+      // ctx 缺 get 时必须能安全退化，否则这里抛错会把整个设置页带崩——
+      // 这正是「整页裸样式」那类故障的另一种触发路径。
+      const slots = ctx.slots !== undefined
+        ? ctx.slots
+        : (typeof ctx.get === 'function' ? ctx.get('slots') : undefined)
       if (slots === undefined) return
       slots.inject('settings.section', () => slots.register(
         { name: 'settings.section', id: SECTION_ID, order: 21, label: '伙伴设置' },

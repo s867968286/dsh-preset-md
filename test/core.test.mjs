@@ -6,7 +6,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 import {
@@ -255,6 +255,86 @@ test('registerPrompt：complete=false 时不带 complete 字段', () => {
   assert.equal('complete' in ctx.sections[0], false)
   rmSync(dir, { recursive: true, force: true })
 })
+
+test('端到端：MD 正文里的花括号不会被官方插值解析（走真实 interpolate）', async () => {
+  /*
+   * 这是**协议依赖型安全**，必须用真实渲染链路锁住，不能只测 substitutePlaceholders。
+   *
+   * 机制：section 的 text 只有 `{{preset_md}}` 一个占位符，MD 正文全在**变量右值**里；
+   * 官方 `interpolate()` 明确「替换值不再被扫描」（源码注释
+   * "substituted values are not scanned again"），所以正文里的 `{{…}}` 原样保留。
+   *
+   * 为什么必须端到端：任何把正文挪回 `section.text` 的重构都会立刻破坏这一点——
+   * 官方严格校验未知变量名 / 非法名字并**抛错**（实测 `{{hl|}}`、`{{挖空}}`、
+   * `{{{triple}}}`、`{{.Server.Version}}` 全部抛错），而局部单测看不出这个回归。
+   */
+  const renderPrompt = await loadOfficialRenderPrompt()
+  if (!renderPrompt) return // 找不到 host 官方包时跳过（不装 host 的 CI 仍能跑其余用例）
+
+  const bodies = [
+    '{{cwd}}',           // 已知占位符名：若被当 section 文本会抛 unknown variable
+    '{{unknown}}',
+    '{{hl|}}',           // wiki 模板语法
+    '{{挖空}}',           // 中文
+    '{{{triple}}}',      // 三层括号
+    '{{我的暗号}}',
+    '{{.Server.Version}}',
+    '{{ preset }}',
+    '{{',               // 无闭合（末尾空白会被 readSectionText trim 掉）
+  ]
+
+  for (const body of bodies) {
+    const dir = makePresetDir({ 'SOUL.md': body })
+    const ctx = makeCtx(pathToFileURL(dir).href)
+    registerPrompt(ctx, { freeze: false })
+
+    // 取本插件实际注册的 section 与变量，走官方真实渲染
+    const section = ctx.sections[0]
+    const rendered = renderPrompt({
+      sections: [{ name: section.name, order: section.order, text: section.text }],
+      variables: { [PROMPT_VARIABLE]: ctx.variables.get(PROMPT_VARIABLE)(asSession('s1')) },
+      contexts: [],
+      tools: [],
+    })
+
+    assert.ok(rendered.includes(body), `正文 ${JSON.stringify(body)} 应原样保留，实际渲染为 ${JSON.stringify(rendered)}`)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+/**
+ * 从 host 安装位置加载官方 `renderPrompt`。
+ *
+ * 本仓库的 node_modules 里没有 `@deepseek-ai/dsh-system-prompt`（它是 host 的依赖），
+ * 所以要动态解析；找不到就返回 null 让用例跳过——静默 return 会让这条端到端锁
+ * 形同虚设，所以这里按「本地 → dsh 自带依赖 → node prefix」逐级尽力去找。
+ */
+async function loadOfficialRenderPrompt() {
+  const { createRequire } = await import('node:module')
+  const here = createRequire(import.meta.url)
+  const nodePrefix = dirname(process.execPath)
+
+  // 候选 require 锚点：从各自锚点解析 @deepseek-ai/dsh-system-prompt
+  const anchors = [
+    import.meta.url,
+    join(nodePrefix, 'node_modules', '@deepseek-ai', 'dsh', 'package.json'),
+    join(nodePrefix, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'index.js'),
+    join(nodePrefix, 'lib', 'node_modules', '@deepseek-ai', 'dsh', 'package.json'),
+  ]
+
+  for (const anchor of anchors) {
+    try {
+      const req = createRequire(anchor)
+      // 直接解析入口（package.json 的 exports 可能不暴露 package.json 本身）
+      const entry = req.resolve('@deepseek-ai/dsh-system-prompt')
+      const mod = await import(pathToFileURL(entry).href)
+      if (typeof mod.renderPrompt === 'function') return mod.renderPrompt
+    } catch {
+      /* 试下一个锚点 */
+    }
+  }
+  return null
+}
 
 test('registerPrompt：会话内冻结，新会话重读；freeze=false 每次重读', () => {
   const dir = makePresetDir({ 'SOUL.md': '第一版' })

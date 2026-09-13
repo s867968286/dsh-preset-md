@@ -1,22 +1,85 @@
 /**
- * 校验用脚本：确认「莉莉预设」与「插件模板」的工具行清单与官方 standard 一致。
+ * 校验用脚本：确认「插件模板」的工具行清单与官方 standard 一致。
  * 只做静态检查（解析 + 对比 + 包存在性），不启动 host。
+ *
+ * 路径全部**动态解析**，不硬编码任何绝对路径：
+ * - 官方包目录：从 `@deepseek-ai/dsh` 的 package.json 反查（借 host 自带的 yaml），
+ *   换机器 / 换 node 版本都不用改脚本。
+ * - 默认只校验 `templates/agent.cordis.yml.tpl`（结果确定，可进 CI）。
+ * - 想额外校验某个本机预设，把路径作为命令行参数传入：
+ *     node scripts/verify-cordis.mjs ~/.dsh/.agent-presets/presetmd-e4d0/agent.cordis.yml
+ *   **不自动探测**：本机可能同时存在多个预设（含实验性的），随便挑一个会产生
+ *   误导性的「缺少官方行」报错。
  */
 import { existsSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { createRequire } from 'node:module'
+import { fileURLToPath } from 'node:url'
 
-// yaml 不是本插件依赖，直接借用 host dsh 自带的副本（不污染插件依赖树）
-const require = createRequire(
-  'D:/soft/node/node-v22.23.2/node_modules/@deepseek-ai/dsh/node_modules/yaml/package.json',
-)
-const YAML = require('yaml')
+// yaml 不是本插件依赖，直接借用 host dsh 自带的副本（不污染插件依赖树）。
+// 从 dsh 主包反查，避免把 node_modules 的绝对路径写死在脚本里。
+const require = createRequire(import.meta.url)
+function resolveDshRoot() {
+  try {
+    return dirname(require.resolve('@deepseek-ai/dsh/package.json'))
+  } catch {
+    /* 回落到下面的候选 */
+  }
+  const candidates = [
+    // 从本仓库向上找 node_modules/@deepseek-ai/dsh
+    ...(() => {
+      const out = []
+      let dir = dirname(fileURLToPath(import.meta.url))
+      for (let i = 0; i < 6; i += 1) {
+        out.push(join(dir, 'node_modules', '@deepseek-ai', 'dsh'))
+        dir = dirname(dir)
+      }
+      return out
+    })(),
+    // 全局安装形态：<node prefix>/node_modules/@deepseek-ai/dsh
+    join(dirname(process.execPath), 'node_modules', '@deepseek-ai', 'dsh'),
+    join(dirname(dirname(process.execPath)), 'lib', 'node_modules', '@deepseek-ai', 'dsh'),
+  ]
+  for (const candidate of candidates) {
+    if (existsSync(join(candidate, 'package.json'))) return candidate
+  }
+  return ''
+}
 
-const NM = 'D:/soft/node/node-v22.23.2/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai'
+const DSH_ROOT = resolveDshRoot()
+if (!DSH_ROOT) {
+  console.error('[ERROR] 找不到 @deepseek-ai/dsh，无法定位官方包与 yaml；请先安装依赖')
+  process.exit(1)
+}
+const NM = join(DSH_ROOT, 'node_modules', '@deepseek-ai')
+
+let YAML
+try {
+  YAML = require(join(DSH_ROOT, 'node_modules', 'yaml'))
+} catch {
+  try {
+    YAML = require('yaml')
+  } catch {
+    console.error('[ERROR] 找不到 yaml（host 自带副本与本地依赖都不可用）')
+    process.exit(1)
+  }
+}
+
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+
 const FILES = {
-  standard: 'D:/soft/node/node-v22.23.2/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-agent-presets/presets/standard/agent.cordis.yml',
-  lil: 'C:/Users/kosei/.dsh/.agent-presets/presetmd-e4d0/agent.cordis.yml',
-  tpl: 'D:/workspaces/ai/dsh-preset-md/templates/agent.cordis.yml.tpl',
+  standard: join(NM, 'dsh-agent-presets', 'presets', 'standard', 'agent.cordis.yml'),
+  tpl: join(REPO_ROOT, 'templates', 'agent.cordis.yml.tpl'),
+}
+// 可选：命令行指定要一并校验的本机预设（不自动探测，见文件头说明）
+const presetArg = process.argv[2]
+if (presetArg) {
+  const file = resolve(presetArg)
+  if (!existsSync(file)) {
+    console.error(`[ERROR] 指定的预设不存在：${file}`)
+    process.exit(1)
+  }
+  FILES.preset = file
 }
 
 /** 递归收集所有插件行（含 group 内嵌 config）。 */
@@ -68,7 +131,8 @@ for (const [key, p] of Object.entries(parsed)) {
 // 官方 persona 行会注入 "You are a coding agent ..." 覆盖它。
 const INTENTIONALLY_OMITTED = new Set(['persona'])
 const stdIds = new Set(parsed.standard.rows.map((r) => r.id).filter((id) => !INTENTIONALLY_OMITTED.has(id)))
-for (const key of ['lil', 'tpl']) {
+// 本机预设是可选对照项：没探测到就不校验它（只校验模板）
+for (const key of ['preset', 'tpl'].filter((k) => parsed[k])) {
   const ids = new Set(parsed[key].rows.map((r) => r.id))
   const missing = [...stdIds].filter((id) => !ids.has(id))
   const extra = [...ids].filter((id) => !stdIds.has(id))

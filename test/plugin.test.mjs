@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-import { apply, inject, localTimestamp, name } from '../src/preset.js'
+import { apply, inject, localTimestamp, MAX_REVIEW_ATTEMPTS, name } from '../src/preset.js'
 import { dateKey } from '../src/memory-store.mjs'
 import { resolvePaths, writeSettings } from '../src/settings.mjs'
 
@@ -49,7 +49,19 @@ function makeCtx(dir) {
     baseUrl: dir ? pathToFileURL(dir).href : undefined,
     sections,
     variables,
+    /*
+     * 事件监听：同一个事件可能被挂多个处理器（本插件现在既听 agent/disposed
+     * 又听 session/event 与 agent/created），所以按事件名累积成数组，
+     * 而不是只保留最后一个。
+     */
     listeners,
+    emit(event, ...args) {
+      for (const handler of listeners.get(event) ?? []) handler(...args)
+    },
+    /** 取某个事件的第一个处理器（多数用例只关心单个）。 */
+    first(event) {
+      return (listeners.get(event) ?? [])[0]
+    },
     registered,
     restricted,
     logs,
@@ -59,7 +71,9 @@ function makeCtx(dir) {
       return fn()
     },
     on(event, handler) {
-      listeners.set(event, handler)
+      const list = listeners.get(event) ?? []
+      list.push(handler)
+      listeners.set(event, list)
       return () => {}
     },
     get(service) {
@@ -101,9 +115,18 @@ function makeCtx(dir) {
   }
 }
 
+/*
+ * 真人发言夹具**必须带 `source.kind`**：官方契约里 `Message.source` 是必填字段，
+ * 而 `user/message` 不区分来源（真人 / 官方运行时快照 / 插件注入都落成它）。
+ * 不带 source 的裸事件在真实会话里并不存在，拿它做夹具等于测不到来源过滤——
+ * 此前正是因此漏掉了「注入消息被当真人发言」这个缺陷。
+ */
 const agentWith = (text) => ({
   id: 'a1',
-  session: { id: 's1', events: [{ type: 'user/message', data: { content: [{ type: 'text', text }] } }] },
+  session: {
+    id: 's1',
+    events: [{ type: 'user/message', data: { content: [{ type: 'text', text }], source: { kind: 'user' } } }],
+  },
 })
 
 test('导出：name / inject', () => {
@@ -211,7 +234,7 @@ test('自动记忆：轮数不足不触发，达到阈值触发一次', async ()
   const dir = mkdtempSync(join(tmpdir(), 'preset-md-auto-'))
   const ctx = makeCtx(dir)
   apply(ctx, {})
-  const turnStopping = ctx.listeners.get('agent/turn-stopping')
+  const turnStopping = ctx.first('agent/turn-stopping')
   assert.equal(typeof turnStopping, 'function')
 
   const agent = agentWith('x'.repeat(200))
@@ -238,7 +261,7 @@ test('自动记忆：会话结束必触发，并清掉该会话的冻结缓存',
   writeFileSync(join(dir, 'SOUL.md'), '第二版', 'utf8')
   assert.equal(read({ agent: { session: { id: 's1' } } }), '第一版')
 
-  const disposed = ctx.listeners.get('agent/disposed')
+  const disposed = ctx.first('agent/disposed')
   disposed({ agent: agentWith('y'.repeat(200)) })
   await tick()
 
@@ -247,12 +270,68 @@ test('自动记忆：会话结束必触发，并清掉该会话的冻结缓存',
   rmSync(dir, { recursive: true, force: true })
 })
 
+test('自动记忆：上下文压缩前强制归档（否则那段内容压缩后再无机会总结）', async () => {
+  /*
+   * 压缩会把老对话摘要掉。若某段工作还没被回顾总结，压缩后就再也没有机会——
+   * 内容已不在事件窗口内。所以在 compaction/start 时强制跑一次回顾。
+   *
+   * 监听口径：session/event 给的是 session，schedule() 需要 agent，
+   * 故本插件从 agent/created 建映射表。
+   */
+  const dir = mkdtempSync(join(tmpdir(), 'preset-md-compact-'))
+  const ctx = makeCtx(dir)
+  apply(ctx, {})
+  assert.equal(typeof ctx.first('session/event'), 'function', '必须监听 session/event')
+
+  // 真人几乎没说话 + 阈值远未达到：正常绝不会触发
+  writeSettings(resolvePaths(), { autoMemory: true, reviewTurns: 99, reviewChars: 999999 })
+  const session = { id: 's1', snapshotEvents: () => [{ type: 'user/message', data: { content: [{ type: 'text', text: 'z'.repeat(200) }], source: { kind: 'user' } } }] }
+  const agent = { id: 'a1', session, inject: () => {} }
+
+  // 先让 agent 被登记（真实环境里 agent/created 先于任何 session/event）
+  ctx.emit('agent/created', { agent })
+
+  // 压缩开始 → 必须强制触发一次
+  ctx.emit('session/event', session, { type: 'compaction/start', data: { compactionId: 'c1', turn: 1 } })
+  await tick()
+  assert.equal(ctx.stats.streams, 1, '压缩开始必须强制归档，绕过阈值与防抖')
+
+  // 其他会话的事件不能误触发
+  ctx.emit('session/event', { id: 'other', snapshotEvents: () => [] }, { type: 'compaction/start', data: {} })
+  await tick()
+  assert.equal(ctx.stats.streams, 1, '别的会话的压缩不该触发本会话')
+
+  // 非 compaction 事件不该触发
+  ctx.emit('session/event', session, { type: 'turn/start', data: {} })
+  await tick()
+  assert.equal(ctx.stats.streams, 1, '与压缩无关的事件不该触发回顾')
+
+  writeSettings(resolvePaths(), { autoMemory: true, reviewTurns: 3, reviewChars: 2000 })
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('自动记忆：关闭 autoMemory 时压缩不触发归档', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'preset-md-compact-off-'))
+  const ctx = makeCtx(dir)
+  apply(ctx, {})
+  writeSettings(resolvePaths(), { autoMemory: false })
+
+  const session = { id: 's1', snapshotEvents: () => [{ type: 'user/message', data: { content: [{ type: 'text', text: 'z'.repeat(200) }], source: { kind: 'user' } } }] }
+  ctx.emit('agent/created', { agent: { id: 'a1', session } })
+  ctx.emit('session/event', session, { type: 'compaction/start', data: {} })
+  await tick()
+  assert.equal(ctx.stats.streams, 0, '开关关闭时压缩也不该写')
+
+  writeSettings(resolvePaths(), { autoMemory: true, reviewTurns: 3, reviewChars: 2000 })
+  rmSync(dir, { recursive: true, force: true })
+})
+
 test('自动记忆：会话结束绕过防抖（刚触发过也要归档最后一段）', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'preset-md-force-'))
   const ctx = makeCtx(dir)
   apply(ctx, {})
-  const turnStopping = ctx.listeners.get('agent/turn-stopping')
-  const disposed = ctx.listeners.get('agent/disposed')
+  const turnStopping = ctx.first('agent/turn-stopping')
+  const disposed = ctx.first('agent/disposed')
   const agent = agentWith('x'.repeat(200))
 
   // 攒够阈值触发一次
@@ -281,8 +360,8 @@ test('自动记忆：回顾进行中结束会话，结束后补跑一次', async
     })()
   }
   apply(ctx, {})
-  const turnStopping = ctx.listeners.get('agent/turn-stopping')
-  const disposed = ctx.listeners.get('agent/disposed')
+  const turnStopping = ctx.first('agent/turn-stopping')
+  const disposed = ctx.first('agent/disposed')
   const agent = agentWith('x'.repeat(200))
 
   for (let i = 0; i < 10; i += 1) turnStopping({ agent })
@@ -304,7 +383,7 @@ test('自动记忆：短对话被跳过（turn_too_short）', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'preset-md-short-'))
   const ctx = makeCtx(dir)
   apply(ctx, {})
-  ctx.listeners.get('agent/disposed')({ agent: agentWith('hi') })
+  ctx.first('agent/disposed')({ agent: agentWith('hi') })
   await tick()
   assert.ok(ctx.logs.info.join('\n').includes('turn_too_short'))
   rmSync(dir, { recursive: true, force: true })
@@ -318,10 +397,10 @@ test('自动记忆：会话只提供 snapshotEvents() 时也能取到转写并�
   // 真实 dsh Session 的形态：**没有 events 属性**，事件只能通过 snapshotEvents() 取。
   // 曾经代码读 session.events → 恒为 undefined → 转写为空 → 每次回顾都被
   // turn_too_short 跳过，日记永远写不出来（改轮数/重启都无效）。
-  const events = [{ type: 'user/message', data: { content: [{ type: 'text', text: 'z'.repeat(200) }] } }]
+  const events = [{ type: 'user/message', data: { content: [{ type: 'text', text: 'z'.repeat(200) }], source: { kind: 'user' } } }]
   const agent = { id: 'a1', session: { id: 's1', snapshotEvents: () => events } }
 
-  ctx.listeners.get('agent/disposed')({ agent })
+  ctx.first('agent/disposed')({ agent })
   await tick()
 
   assert.equal(ctx.stats.streams, 1, '必须真的发起回顾调用，而不是被 turn_too_short 跳过')
@@ -343,11 +422,11 @@ test('自动记忆：转写窗口不因 reviewChars 调小而回缩（阈值与�
     })()
   }
   apply(ctx, {})
-  const disposed = ctx.listeners.get('agent/disposed')
+  const disposed = ctx.first('agent/disposed')
 
   // 阈值远小于 minChars(80) 时，旧实现会把窗口压到同等大小 → 转写不足 80 → 永远跳过。
   // 现在窗口有下限：只放大、不回缩，所以照样能取到完整转写。
-  const events = [{ type: 'user/message', data: { content: [{ type: 'text', text: '开头标志' + 'x'.repeat(1000) }] } }]
+  const events = [{ type: 'user/message', data: { content: [{ type: 'text', text: '开头标志' + 'x'.repeat(1000) }], source: { kind: 'user' } } }]
   const agent = { id: 'a1', session: { id: 's1', snapshotEvents: () => events } }
   disposed({ agent })
   await tick()
@@ -362,7 +441,7 @@ test('自动记忆：拿不到任何模型时跳过并 warn', async () => {
   const ctx = makeCtx(dir)
   ctx.get = () => undefined
   apply(ctx, {})
-  ctx.listeners.get('agent/disposed')({ agent: agentWith('z'.repeat(200)) })
+  ctx.first('agent/disposed')({ agent: agentWith('z'.repeat(200)) })
   await tick()
   assert.ok(ctx.logs.warn.join('\n').includes('拿不到会话模型与默认模型'))
   rmSync(dir, { recursive: true, force: true })
@@ -382,7 +461,7 @@ test('自动记忆：优先用当前会话正在跑的模型（requestHeader）�
   }
   apply(ctx, {})
 
-  const events = [{ type: 'user/message', data: { content: [{ type: 'text', text: 'x'.repeat(200) }] } }]
+  const events = [{ type: 'user/message', data: { content: [{ type: 'text', text: 'x'.repeat(200) }], source: { kind: 'user' } } }]
   const agent = {
     id: 'a1',
     session: {
@@ -392,7 +471,7 @@ test('自动记忆：优先用当前会话正在跑的模型（requestHeader）�
       requestHeader: () => ({ config: { provider: 'session-provider', model: 'session-model' } }),
     },
   }
-  ctx.listeners.get('agent/disposed')({ agent })
+  ctx.first('agent/disposed')({ agent })
   await tick()
 
   assert.deepEqual(seen, { provider: 'session-provider', model: 'session-model' }, '回顾必须跟会话用同一个模型')
@@ -403,8 +482,8 @@ test('参数实时生效：改设置文件后无需重启/新会话即改变触�
   const dir = mkdtempSync(join(tmpdir(), 'preset-md-live-'))
   const ctx = makeCtx(dir)
   apply(ctx, {})
-  const turnStopping = ctx.listeners.get('agent/turn-stopping')
-  const events = [{ type: 'user/message', data: { content: [{ type: 'text', text: 'x'.repeat(200) }] } }]
+  const turnStopping = ctx.first('agent/turn-stopping')
+  const events = [{ type: 'user/message', data: { content: [{ type: 'text', text: 'x'.repeat(200) }], source: { kind: 'user' } } }]
   const agent = { id: 'a1', session: { id: 's1', snapshotEvents: () => events } }
 
   // 关掉自动记忆（写真实 settings 文件，路径已由 TEST_HOME 隔离）→ 立即不再触发
@@ -436,13 +515,13 @@ test('触发条件满足但执行失败时，把提示注入对话（模型可�
   apply(ctx, {})
 
   const injected = []
-  const events = [{ type: 'user/message', data: { content: [{ type: 'text', text: 'x'.repeat(200) }] } }]
+  const events = [{ type: 'user/message', data: { content: [{ type: 'text', text: 'x'.repeat(200) }], source: { kind: 'user' } } }]
   const agent = {
     id: 'a1',
     session: { id: 's1', snapshotEvents: () => events },
     inject: (message) => injected.push(message),
   }
-  ctx.listeners.get('agent/disposed')({ agent })
+  ctx.first('agent/disposed')({ agent })
   await tick()
 
   assert.equal(injected.length, 1, '失败必须让用户在对话里看得见')
@@ -450,6 +529,112 @@ test('触发条件满足但执行失败时，把提示注入对话（模型可�
   assert.ok(text.includes('执行失败'), '提示需说明是「已触发但失败」')
   assert.ok(text.includes('模拟 provider 故障'), '提示需带上失败原因')
   assert.ok(ctx.logs.warn.join('\n').includes('自动记忆失败'))
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('自动记忆：执行失败不推进水位（下一轮重试同一段）', async () => {
+  /*
+   * 这条锁的是「水位在执行前推进 → 失败静默丢内容」这个缺陷。
+   *
+   * 早先 `markChars` / `turns` 在 schedule() 的同步阶段就推进，早于 LLM 调用；
+   * 失败分支又只打日志不回滚，那一轮内容的水位被白白消耗——长会话里这段内容
+   * 滚出尾部窗口后就再也轮不到，日志与界面都看不出发生过。
+   *
+   * 为什么必须走 turn-stopping 且用 turns 阈值（而不是 disposed/force）：
+   * disposed 走 force，绕过防抖与阈值判断，**测不出水位是否被消费**。
+   * 这里把触发权交给「轮数」，水位一旦被错误推进，后续轮次就再也凑不够阈值。
+   * 轮数为 3 时第 3 轮触发；失败后若不推进水位，第 4 轮应再次触发。
+   */
+  const dir = mkdtempSync(join(tmpdir(), 'preset-md-nowater-'))
+  const ctx = makeCtx(dir)
+  apply(ctx, {})
+  writeSettings(resolvePaths(), { autoMemory: true, reviewTurns: 3, reviewChars: 2000 })
+
+  let attempt = 0
+  ctx.llm.stream = () => {
+    attempt += 1
+    ctx.stats.streams += 1
+    if (attempt === 1) {
+      return (async function* () {
+        throw new Error('模拟首次故障')
+        // eslint-disable-next-line no-unreachable
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      })()
+    }
+    return (async function* () {
+      yield { type: 'text-delta', text: '{"journal":"### 讨论与解决\\n\\n第二次成功","updates":[]}' }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    })()
+  }
+
+  const events = [{ type: 'user/message', data: { content: [{ type: 'text', text: 'z'.repeat(300) }], source: { kind: 'user' } } }]
+  const agent = { id: 'a1', session: { id: 's1', snapshotEvents: () => events } }
+  const turnStopping = ctx.first('agent/turn-stopping')
+
+  // 攒到第 3 轮 → 触发，但这次必然失败
+  for (let i = 0; i < 3; i += 1) turnStopping({ agent })
+  await tick()
+  assert.equal(ctx.stats.streams, 1)
+  assert.ok(ctx.logs.warn.join('\n').includes('模拟首次故障'), '首次必须真的失败')
+
+  /*
+   * 第二次：等过 5 秒防抖后同一段内容仍在。
+   * 修复后 turns 在第 4 轮达到 3 → 再次触发并成功；
+   * 若水位/轮数在失败时被推进（旧行为），这里的 grown 与 turns 都归零，
+   * 第 4 轮凑不够阈值 → streams 仍是 1，断言失败。
+   */
+  await new Promise((resolve) => setTimeout(resolve, 5300))
+  ctx.logs.info.length = 0
+  turnStopping({ agent })
+  await new Promise((resolve) => setTimeout(resolve, 80))
+  assert.equal(ctx.stats.streams, 2, '失败后必须重试同一段，不能被水位吞掉')
+  assert.ok(
+    readFileSync(join(dir, 'memory', `${dateKey()}.md`), 'utf8').includes('第二次成功'),
+    '重试成功后内容应落盘（证明失败那轮的水位确实没被推进）',
+  )
+
+  writeSettings(resolvePaths(), { autoMemory: true, reviewTurns: 3, reviewChars: 2000 })
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('自动记忆：连续失败到上限后放弃这一段，避免水位永久卡死', async () => {
+  /*
+   * 「失败不推进水位」必须有上限：一段坏内容（模型持续吐非法 JSON 等）会让
+   * 水位永久卡死，后面的内容再也轮不到。达到 MAX_REVIEW_ATTEMPTS 后强制推进。
+   */
+  const dir = mkdtempSync(join(tmpdir(), 'preset-md-giveup-'))
+  const ctx = makeCtx(dir)
+  apply(ctx, {})
+  writeSettings(resolvePaths(), { autoMemory: true, reviewTurns: 1, reviewChars: 1 })
+
+  ctx.llm.stream = () => {
+    ctx.stats.streams += 1
+    return (async function* () {
+      throw new Error('模拟持续故障')
+      // eslint-disable-next-line no-unreachable
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    })()
+  }
+
+  const agent = {
+    id: 'a1',
+    inject: () => {},
+    session: { id: 's1', snapshotEvents: () => [{ type: 'user/message', data: { content: [{ type: 'text', text: 'z'.repeat(300) }], source: { kind: 'user' } } }] },
+  }
+  const turnStopping = ctx.first('agent/turn-stopping')
+
+  // 跑满上限次数（每次之间要跨过 5 秒防抖，force 走 disposed 更直接）
+  for (let i = 0; i < MAX_REVIEW_ATTEMPTS; i += 1) {
+    ctx.first('agent/disposed')({ agent })
+    await new Promise((resolve) => setTimeout(resolve, 60))
+  }
+  assert.equal(ctx.stats.streams, MAX_REVIEW_ATTEMPTS)
+  assert.ok(
+    ctx.logs.warn.join('\n').includes('放弃这一段'),
+    '连续失败到上限必须放弃这一段，否则水位永久卡死',
+  )
+
+  writeSettings(resolvePaths(), { autoMemory: true, reviewTurns: 3, reviewChars: 2000 })
   rmSync(dir, { recursive: true, force: true })
 })
 
@@ -461,10 +646,10 @@ test('正常跳过（对话太短）不注入对话提示，只在日志留痕',
   const injected = []
   const agent = {
     id: 'a1',
-    session: { id: 's1', snapshotEvents: () => [{ type: 'user/message', data: { content: [{ type: 'text', text: 'hi' }] } }] },
+    session: { id: 's1', snapshotEvents: () => [{ type: 'user/message', data: { content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } } }] },
     inject: (message) => injected.push(message),
   }
-  ctx.listeners.get('agent/disposed')({ agent })
+  ctx.first('agent/disposed')({ agent })
   await tick()
 
   assert.equal(injected.length, 0, '正常跳过不该打扰用户')
@@ -476,7 +661,7 @@ test('自动记忆：回顾结果落到当天日志文件', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'preset-md-journal-'))
   const ctx = makeCtx(dir)
   apply(ctx, {})
-  ctx.listeners.get('agent/disposed')({ agent: agentWith('z'.repeat(200)) })
+  ctx.first('agent/disposed')({ agent: agentWith('z'.repeat(200)) })
   await tick()
   const text = readFileSync(join(dir, 'memory', `${dateKey()}.md`), 'utf8')
   assert.ok(text.includes('聊了插件设计'))

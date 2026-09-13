@@ -224,7 +224,7 @@ export function applyUpdate(dir, file, op, content, oldText, now = new Date()) {
 
 /* ────────────────────────────── changelog ────────────────────────────── */
 
-/** 某个 MD 文件对应的 changelog 路径：`memory/changelog/SOUL.changelog.md`。 */
+/** 某个 MD 文件对应的 changelog 路径：`<预设目录>/changelog/SOUL.changelog.md`。 */
 export function changelogPath(dir, file) {
   const base = String(file || '').replace(/\.md$/i, '')
   return join(dir, CHANGELOG_DIR, `${base}.changelog.md`)

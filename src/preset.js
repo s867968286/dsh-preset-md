@@ -21,7 +21,6 @@ import {
   PROMPT_SECTION,
   PROMPT_VARIABLE,
   applyToolRestriction,
-  contextBudgetNotice,
   measureContext,
   normalizeConfig,
   registerPrompt,
@@ -31,7 +30,7 @@ import {
 import { readSettings, resolvePaths } from './settings.mjs'
 import { createSearchTool } from './search.mjs'
 import { createJournalTool, createMemoryTool } from './tools.mjs'
-import { runReview } from './review.mjs'
+import { isHumanMessage, runReview } from './review.mjs'
 
 /** 触发防抖（毫秒），写死。 */
 const REVIEW_DEBOUNCE_MS = 5000
@@ -41,6 +40,13 @@ const RUNNING_STALE_MS = 5 * 60 * 1000
 
 /** 同一条会话的「失败提示」最短重复间隔（毫秒）：失败要看得见，但不能刷屏。 */
 const NOTICE_THROTTLE_MS = 60 * 1000
+
+/**
+ * 连续失败上限：失败不推进水位是为了让下一轮重试同一段，但不能无限重试——
+ * 一段坏内容（例如模型持续吐非法 JSON）会让水位永久卡死，后面的内容再也轮不到。
+ * 达到上限就放弃这一段强制推进，与 `dsh-memory-md` 的 `MAX_SUMMARY_ATTEMPTS` 同一做法。
+ */
+export const MAX_REVIEW_ATTEMPTS = 3
 
 /** 日志文件上限（字节）：超过就只保留后半，避免无限增长。 */
 const LOG_MAX_BYTES = 256 * 1024
@@ -133,11 +139,17 @@ function textLength(content) {
   )
 }
 
-/** 会话累计文本长度（用于判断「新增了多少」）。 */
+/**
+ * 会话累计文本长度（用于判断「新增了多少」）。
+ *
+ * 只计**真人**发言与助手回复：官方运行时快照、其他插件的注入消息一律不计入。
+ * 否则注入文本会撑大 `grown`，让回顾在真人几乎没说话时就被触发——
+ * 实测某工作区的会话里 user/message 字符有 96% 来自注入而非真人。
+ */
 function transcriptChars(events) {
   let total = 0
   for (const event of Array.isArray(events) ? events : []) {
-    if (event?.type === 'user/message') total += textLength(event.data?.content)
+    if (isHumanMessage(event)) total += textLength(event.data?.content)
     else if (event?.type === 'assistant/message') total += textLength(event.data?.message?.content)
   }
   return total
@@ -288,13 +300,32 @@ function shortKey(key) {
  * 失败发生在后台，日志又只在 dsh 进程的 stdout，用户默认看不到。
  */
 function registerAutoMemory(ctx, prompt, getSettings, logger) {
-  /** sessionKey -> { turns, markChars, lastAt, running, runningSince, pending, lastNoticeAt } */
+  /** sessionKey -> { turns, markChars, lastAt, running, runningSince, pending, lastNoticeAt, attempts } */
   const states = new Map()
+
+  /**
+   * sessionKey -> agent。
+   *
+   * `session/event` 只给 session，而 schedule() 需要 agent（读 requestHeader 取模型、
+   * 用 agent.inject 发提示），所以从 `agent/created` 建一张映射表。
+   */
+  const agentsBySession = new Map()
 
   const stateOf = (key) => {
     let state = states.get(key)
     if (!state) {
-      state = { turns: 0, markChars: 0, lastAt: 0, running: false, runningSince: 0, pending: '', lastNoticeAt: 0 }
+      state = {
+        turns: 0,
+        markChars: 0,
+        lastAt: 0,
+        running: false,
+        runningSince: 0,
+        pending: '',
+        lastNoticeAt: 0,
+        // 连续失败次数：失败不推进水位是为了重试，但必须有上限，
+        // 否则一段坏内容会让该会话的水位永久卡死。
+        attempts: 0,
+      }
       states.set(key, state)
     }
     return state
@@ -378,10 +409,18 @@ function registerAutoMemory(ctx, prompt, getSettings, logger) {
     state.lastAt = now
     state.running = true
     state.runningSince = now
-    state.turns = 0
-    state.markChars = transcriptCharsOf(agent)
+    /*
+     * 水位**先算出来但不写回 state**：只有回顾真正成功后才提交（见 finally）。
+     *
+     * 早先是同步阶段就 `state.markChars = transcriptCharsOf(agent)`，早于 LLM 调用；
+     * 失败分支又只打日志不回滚，于是那一轮内容的水位被白白推进——
+     * 长会话里这段内容滚出尾部窗口后就**静默丢失**，日志和界面都看不出发生过。
+     */
+    const marksAt = transcriptCharsOf(agent)
 
     void (async () => {
+      // 是否算「已消费掉这段内容」：失败（含解析失败）一律 false，下一轮重试同一段
+      let consumed = false
       try {
         // 实时读设置：阈值可能与触发时不同了，用最新值决定转写窗口
         const settings = getSettings()
@@ -403,15 +442,18 @@ function registerAutoMemory(ctx, prompt, getSettings, logger) {
           onWarn: (message) => logger.warn?.(`[preset-md] ${message}`),
         })
         if (result.skipped) {
-          // 正常跳过（例如对话太短），只在日志里留痕，不打扰用户
+          // 正常跳过（例如对话太短）：这是终态，不算失败，照常推进水位。
+          consumed = true
           logger.info?.(`[preset-md] 自动记忆跳过（${result.skipped}，触发=${reason}，会话=${shortKey(key)}）`)
         } else if (result.parseFailed) {
+          // 解析失败 = 日记与记忆都没写入，这段内容**没被消费**：不推进水位，下轮重试
           const detail = '模型输出解析失败，本轮日记与记忆都没写入'
           logger.warn?.(
             `[preset-md] 自动记忆已触发（${reason}，会话=${shortKey(key)}）但${detail}。原文片段：${result.parseFailed}`,
           )
           notify(agent, key, `自动记忆已满足触发条件（${reason}），但${detail}。`)
         } else {
+          consumed = true
           const applied = (result.applied ?? []).join(', ')
           if (applied) {
             logger.info?.(`[preset-md] 自动记忆完成（触发=${reason}，会话=${shortKey(key)}）：${applied}`)
@@ -432,6 +474,28 @@ function registerAutoMemory(ctx, prompt, getSettings, logger) {
         logger.warn?.(`[preset-md] 自动记忆失败：${detail}`)
         notify(agent, key, `自动记忆已满足触发条件（${reason}），但执行失败：${detail}`)
       } finally {
+        /*
+         * 水位提交策略：成功才推进，失败保留游标让下一轮自然重试同一段。
+         *
+         * 但不能无限重试——一段坏内容（例如模型持续吐非法 JSON）会让水位永久卡死，
+         * 后面的内容再也轮不到。连续失败到 MAX_REVIEW_ATTEMPTS 就放弃这一段强制推进，
+         * 与 dsh-memory-md 的 MAX_SUMMARY_ATTEMPTS 同一做法。
+         *
+         * `turns` 同理：失败时**不清零**，否则「轮数阈值」也被白白消耗掉。
+         */
+        const attempts = consumed ? 0 : state.attempts + 1
+        const giveUp = !consumed && attempts >= MAX_REVIEW_ATTEMPTS
+        if (consumed || giveUp) {
+          state.turns = 0
+          state.markChars = marksAt
+        }
+        state.attempts = attempts
+        if (giveUp) {
+          logger.warn?.(
+            `[preset-md] 自动记忆连续 ${attempts} 次失败，放弃这一段（触发=${reason}，会话=${shortKey(key)}），` +
+              `避免水位永久卡死；后续内容仍会正常回顾`,
+          )
+        }
         state.running = false
         state.runningSince = 0
         // 会话结束时被 running 挡下的那次补跑
@@ -464,7 +528,40 @@ function registerAutoMemory(ctx, prompt, getSettings, logger) {
     if (getSettings().autoMemory === true) schedule(agent, key, '会话结束', true)
     // 提示词缓存按会话键存放，会话结束一并清掉，避免 Map 增长
     prompt.cache.clear(key)
+    agentsBySession.delete(key)
     // 留足时间给可能正在跑的回顾（含补跑），之后才清状态
     setTimeout(() => states.delete(key), RUNNING_STALE_MS).unref?.()
+  })
+
+  /*
+   * ── 压缩前 flush ──
+   *
+   * 上下文压缩（compaction）会把老对话摘要掉：若某段工作还没被回顾总结，
+   * 压缩后就**再也没有机会**总结它——内容已不在事件窗口内。
+   *
+   * `session/event` 给的是 session，而 schedule() 需要 agent（要读 requestHeader
+   * 取模型、要 agent.inject 发提示），所以用 agent/created 维护一张映射表。
+   */
+  ctx.on('agent/created', (payload) => {
+    const agent = payload?.agent
+    const key = sessionKeyOf(agent)
+    if (key) agentsBySession.set(key, agent)
+  })
+
+  ctx.on('session/event', (session, event) => {
+    if (event?.type !== 'compaction/start') return
+    if (getSettings().autoMemory !== true) return
+    const key = sessionKeyOf({ session })
+    if (!key) return
+    const agent = agentsBySession.get(key)
+    if (!agent) return
+    /*
+     * force：压缩是「最后机会」，不能被 5 秒防抖吞掉。
+     * 若此时正好有回顾在跑，schedule 会记 pending 并在其结束后补跑。
+     *
+     * `turn/start` 之外的边界：这里不 await（schedule 本身就是后台异步），
+     * 压缩流程不会被这次回顾拖住——即使回顾很慢，压缩照常进行。
+     */
+    schedule(agent, key, '压缩前归档', true)
   })
 }

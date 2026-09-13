@@ -122,14 +122,6 @@ export function generateId(name, existing) {
   throw new Error('生成 id 冲突次数过多')
 }
 
-/** 该预设是否挂了我们插件的 preset 行（读 agent.cordis.yml 找 `- id: preset-md`）。 */
-export function usesPresetMd(dir) {
-  const text = readText(join(dir, 'agent.cordis.yml'))
-  // 允许行尾注释（`- id: preset-md  # 注入`）；名或 id 命中其一即可
-  return /^[ \t]*-[ \t]*id:[ \t]*preset-md[ \t]*(#.*)?$/m.test(text) ||
-    /^[ \t]*name:[ \t]*dsh-preset-md(\/preset)?[ \t]*(#.*)?$/m.test(text)
-}
-
 /**
  * 下一个可用的 order。
  *
@@ -160,8 +152,6 @@ export function listAgents(paths) {
       name: meta.name || entry.name,
       description: meta.description,
       order: meta.order ?? Number.MAX_SAFE_INTEGER,
-      usesPresetMd: usesPresetMd(dir),
-      hasMemory: existsSync(join(dir, 'memory')),
     })
   }
   return rows.sort((a, b) => a.order - b.order || a.id.localeCompare(b.id))
@@ -179,28 +169,8 @@ export function readAgent(paths, id) {
     id,
     name: meta.name || id,
     description: meta.description,
-    usesPresetMd: usesPresetMd(dir),
     files,
   }
-}
-
-/** 给没挂本插件的预设追加 preset 行（B 方案「转成本插件」）。已挂则跳过。 */
-export function upgradeToPresetMd(paths, id) {
-  if (!PRESET_ID.test(id)) throw new Error(`非法 id：${id}`)
-  const dir = join(paths.presetsRoot, id)
-  if (!existsSync(dir)) throw new Error(`伙伴不存在：${id}`)
-  if (usesPresetMd(dir)) return { ok: true, already: true }
-  const file = join(dir, 'agent.cordis.yml')
-  const prev = readText(file)
-  const addition = [
-    '',
-    '# ── 提示词注入与自动记忆（dsh-preset-md preset 行）──',
-    '- id: preset-md',
-    '  name: dsh-preset-md/preset',
-    '',
-  ].join('\n')
-  atomicWrite(file, `${prev.replace(/\s+$/, '')}\n${addition}`)
-  return { ok: true, already: false }
 }
 
 /** 写一个 MD 文件（白名单内）。走 memory-store 的写队列，避免与后台自动记忆
