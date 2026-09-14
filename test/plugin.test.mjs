@@ -379,6 +379,37 @@ test('自动记忆：回顾进行中结束会话，结束后补跑一次', async
   rmSync(dir, { recursive: true, force: true })
 })
 
+test('自动记忆：fork 子会话的继承前缀不计入触发阈值（回归）', async () => {
+  /*
+   * 真事故（2026-09-14 实测）：子代理会话由 fork 派生，磁盘上带着父会话完整历史。
+   * 若用 snapshotEvents()（含继承前缀），会话第一轮就把整段前缀算成「新增」——
+   * 本机 7 个 presetmd 子会话的转写有 90%～99% 来自父会话，于是每个子会话
+   * 第 1 轮必然越线触发，且回顾的是"父会话做了什么"。
+   *
+   * 这条锁住：阈值只由**本会话自有事件**撑起。
+   */
+  const dir = mkdtempSync(join(tmpdir(), 'preset-md-fork-'))
+  const ctx = makeCtx(dir)
+  apply(ctx, {})
+  writeSettings(resolvePaths(), { autoMemory: true, reviewTurns: 3, reviewChars: 2000 })
+
+  // 父会话继承来的大段内容（超过 reviewChars）+ 本会话只有一句短话
+  const inherited = [{ type: 'user/message', data: { content: [{ type: 'text', text: '父会话内容'.repeat(500) }], source: { kind: 'user' } } }]
+  const own = [{ type: 'user/message', data: { content: [{ type: 'text', text: '嗯' }], source: { kind: 'user' } } }]
+  const agent = {
+    id: 'a1',
+    session: { id: 's1', snapshotEvents: () => inherited, ownEvents: () => own },
+  }
+
+  // 1 轮：既有事件远未达轮数阈值，自有内容也远未达字符阈值 → 不该触发
+  ctx.first('agent/turn-stopping')({ agent })
+  await tick()
+  assert.equal(ctx.stats.streams, 0, '继承前缀不得把阈值灌满（否则第 1 轮就误触发）')
+
+  writeSettings(resolvePaths(), { autoMemory: true, reviewTurns: 3, reviewChars: 2000 })
+  rmSync(dir, { recursive: true, force: true })
+})
+
 test('自动记忆：短对话被跳过（turn_too_short）', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'preset-md-short-'))
   const ctx = makeCtx(dir)

@@ -18,6 +18,8 @@ export const REVIEW_SYSTEM_PROMPT = [
   '有这行摘要时，它会被检索索引直接展示，是未来回忆时的第一眼；确实没有一句话结论时，直接省略它。',
   'journal 其余内容按需分三段：① 讨论与解决（这次聊了什么、解决了什么）② 关键信息（值得长期留存的事实、结论、偏好）③ 感悟（结合记忆与日志的真实感受，像人写日记，不要套话空话）。',
   '**这几段都不要求写满**：摘要、讨论与解决、关键信息、感悟，没有对应内容的就整段省略，不要为了凑格式写空话。只写真正发生、值得留存的那部分。',
+  // 讲清代价：模型不知道「写多了会全丢」时倾向于写满，而截断是整轮丢弃。
+  '输出有长度上限，写太长会被**硬截断**，结果是这一轮什么记录都留不下（日记与记忆更新全部作废）——宁可少写几条、每条写完整。',
   'journal 什么时候要写：只要本轮出现了「今天的日志里还没有、且值得以后回看」的内容，就照常新增一个段落。若下面已给出「今天的日志」，那几段属于之前的轮次——不要重复它们的内容，但也**不要因为它们存在就留空**。',
   '通常值得记的有：他给出的偏好 / 决定 / 约定 / 边界、达成的结论与取舍理由、排查出的根因与踩过的坑、关系或情绪的转折、新确认的项目与环境事实。',
   '以下情形**不要记录**，journal 直接给空字符串即可：',
@@ -57,6 +59,9 @@ export function isHumanMessage(event) {
 }
 
 /** 把会话事件里的 user/assistant 文本拼成转写（取尾部，超长截断）。 */
+/** 转写被窗口截断时加的标记：让模型（和看日志的人）知道前文被省略了。 */
+export const TRANSCRIPT_TRUNCATED_MARK = '…（前文略）'
+
 export function buildTranscript(events, maxChars = DEFAULT_TRANSCRIPT_CHARS) {
   const lines = []
   for (const event of Array.isArray(events) ? events : []) {
@@ -69,7 +74,11 @@ export function buildTranscript(events, maxChars = DEFAULT_TRANSCRIPT_CHARS) {
     }
   }
   const joined = lines.join('\n\n')
-  return joined.length > maxChars ? joined.slice(joined.length - maxChars) : joined
+  // 超长保留**尾部**（本轮的结论比开头更值得总结），但显式标记被省略过 ——
+  // 静默 slice 会让人以为"这轮就这么点内容"，排查时看不出窗口截断。
+  return joined.length > maxChars
+    ? `${TRANSCRIPT_TRUNCATED_MARK}\n\n${joined.slice(joined.length - maxChars)}`
+    : joined
 }
 
 function textOf(content) {
@@ -233,8 +242,20 @@ export function repairBareNewlines(text) {
 /** 单次回顾的默认超时（毫秒）。provider 挂住时必须能自己退出，否则 running 标志永久卡死。 */
 export const REVIEW_TIMEOUT_MS = 120_000
 
+/**
+ * 单次回顾的输出上限（token）。
+ *
+ * 实测真实日记段落平均约 310 token、最长 579 token（用 estimateTokens 量的
+ * lili 预设 15 段），2048 看似够用；但撞上限的后果是**整段 JSON 缺尾 → 这轮
+ * 什么记录都留不下**，而截断是概率问题（某段特别啰嗦、updates 又比较多时就会撞）。
+ * 提到 4000 是把概率压低，不是消除——真正的兜底是识别 `max-tokens` 后在日志里说清。
+ *
+ * 参考：dsh-memory-md 在同类场景用 4000。
+ */
+export const REVIEW_MAX_TOKENS = 4000
+
 /** 调用一次 LLM 文本生成（官方 `createUserMessage` + `BlockAssembler`）。 */
-export async function callText(ctx, { provider, model, system, prompt, maxTokens = 2048, signal, timeoutMs = REVIEW_TIMEOUT_MS }) {
+export async function callText(ctx, { provider, model, system, prompt, maxTokens = REVIEW_MAX_TOKENS, signal, timeoutMs = REVIEW_TIMEOUT_MS, onFinish }) {
   const message = createUserMessage({
     content: [{ type: 'text', text: prompt }],
     source: {
@@ -290,6 +311,13 @@ export async function callText(ctx, { provider, model, system, prompt, maxTokens
     if (finish?.kind === 'error' || finish?.kind === 'aborted') {
       throw new Error(`回顾 LLM 流未正常完成（${finish.kind}）`)
     }
+    /*
+     * `max-tokens` 是「输出被上限硬截断」的明确信号（官方 FinishReasonMap）。
+     * 不在这里抛错——截断的输出里往往还有能用的部分，交给调用方决定怎么处理
+     * （重试 / 抢救 / 只记日志）。但要**把它报出去**，否则「JSON 为什么坏」
+     * 只能靠猜：这正是此前 14 次解析失败无法定位的原因。
+     */
+    onFinish?.(finish)
     return assembler
       .blocks()
       .filter((block) => block.type === 'text')
@@ -326,19 +354,43 @@ export async function runReview({ ctx, dir, session, provider, model, now = new 
   // 只取「当天」的日志（按日期直接定位，不用 listJournalFiles —— 它现在返回最近 N 个文件）
   const todayJournal = readText(journalPath(dir, dateKey(now)))
 
+  /*
+   * 观测：把 finish 原因与输出规模记下来。
+   *
+   * 为什么必须观测：`onWarn` 报出的原文片段自带 500 字符截断（见 parseReviewJson），
+   * 光看日志**无法判断**解析失败到底是不是「输出撞上限被硬截断」——此前 14 次
+   * 解析失败就一直定位不了根因。记下 finish.kind 与 raw 长度后，两者一对就明确。
+   */
+  let finishKind = ''
   const raw = await callText(ctx, {
     provider,
     model,
     system: REVIEW_SYSTEM_PROMPT,
     prompt: buildReviewInput({ transcript, todayJournal, files }),
-    maxTokens: 2048,
+    maxTokens: REVIEW_MAX_TOKENS,
     signal,
+    onFinish: (finish) => { finishKind = finish?.kind ?? '' },
   })
+  const truncated = finishKind === 'max-tokens'
   const parsed = parseReviewJson(raw)
   const applied = []
 
   if (parsed.raw) {
-    onWarn?.(`回顾输出无法解析成 JSON，本轮未写入任何内容。原文片段：${parsed.raw}`)
+    /*
+     * 解析失败时把**可判定根因**的字段一并报出：finish 原因 + 输出长度。
+     * 截断（max-tokens）与「模型写了非 JSON 的散文」是两种完全不同的故障，
+     * 处理方式也不同，日志里必须能区分。
+     */
+    const cause = truncated
+      ? `输出撞上上限被截断（finish=max-tokens，上限 ${REVIEW_MAX_TOKENS} token，输出 ${raw.length} 字符）`
+      : `finish=${finishKind || '未知'}，输出 ${raw.length} 字符`
+    onWarn?.(`回顾输出无法解析成 JSON（${cause}），本轮未写入任何内容。原文片段：${parsed.raw}`)
+  } else if (truncated) {
+    // 截断但恰好解析成功：JSON 的尾巴可能已经丢了（例如 updates 被吃掉），必须留痕
+    onWarn?.(
+      `回顾输出撞上上限被截断（finish=max-tokens，输出 ${raw.length} 字符），` +
+        `虽然解析成功，但内容可能不完整（例如 updates 被截掉）。`,
+    )
   }
 
   if (parsed.journal) {
@@ -367,6 +419,9 @@ export async function runReview({ ctx, dir, session, provider, model, now = new 
     applied,
     journalEmpty: !parsed.journal,
     transcriptLength: transcript.trim().length,
+    // finish 原因交给调用方：截断时即使写入了内容，也属于「可能不完整」，日志要能区分。
+    finish: finishKind,
+    truncated,
   }
   if (parsed.raw) result.parseFailed = parsed.raw
   return result

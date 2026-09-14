@@ -19,14 +19,12 @@ export const DEFAULT_SETTINGS = {
   // 而会话结束只在 agent 销毁（关窗口、切会话）时发生，体感就是「根本不触发」。
   reviewTurns: 3,
   reviewChars: 2000,
-  freeze: true,
-  complete: true,
   contextBudget: DEFAULT_CONTEXT_BUDGET,
   budgetNotice: true,
 }
 
 /** 布尔开关的键。 */
-const BOOLEAN_KEYS = ['autoMemory', 'freeze', 'complete', 'budgetNotice']
+const BOOLEAN_KEYS = ['autoMemory', 'budgetNotice']
 /** 数值键。 */
 export const NUMERIC_KEYS = ['reviewTurns', 'reviewChars', 'contextBudget']
 

@@ -127,32 +127,82 @@ for (const [key, p] of Object.entries(parsed)) {
   else say('INFO', `${key} YAML 解析通过，顶层+嵌套共 ${p.rows.length} 行插件`)
 }
 
-// persona 有意省略：人格由预设的 SYSTEM.md / IDENTITY.md 承载，
-// 官方 persona 行会注入 "You are a coding agent ..." 覆盖它。
+/*
+ * 2. 行清单：模板是**人格类**预设，有意不含官方 standard 的重型机械，
+ *    所以不能要求「官方行齐备」。改成校验几条真正的意图：
+ *    - 不许挂 persona（人格由 MD 承载，官方 persona 会覆盖它）；
+ *    - 模板的行必须能在官方 standard 里找到同名行（防止拼错 name/id）；
+ *    - 有意省略的那批行不许偷偷跑回来。
+ * 本机预设（命令行传入）同样按这套口径校验。
+ */
 const INTENTIONALLY_OMITTED = new Set(['persona'])
-const stdIds = new Set(parsed.standard.rows.map((r) => r.id).filter((id) => !INTENTIONALLY_OMITTED.has(id)))
-// 本机预设是可选对照项：没探测到就不校验它（只校验模板）
-for (const key of ['preset', 'tpl'].filter((k) => parsed[k])) {
-  const ids = new Set(parsed[key].rows.map((r) => r.id))
-  const missing = [...stdIds].filter((id) => !ids.has(id))
-  const extra = [...ids].filter((id) => !stdIds.has(id))
-  if (missing.length) say('ERROR', `${key} 缺少官方行：${missing.join(', ')}`)
-  else say('INFO', `${key} 官方 ${stdIds.size} 行全部齐备`)
-  // preset-md 是自研行，允许额外存在
-  const unexpected = extra.filter((id) => id !== 'preset-md')
-  if (unexpected.length) say('ERROR', `${key} 多出非预期行：${unexpected.join(', ')}`)
-  else say('INFO', `${key} 额外行仅 preset-md（自研，符合预期）`)
+/** 人格类预设有意不挂的重型机械（改了这里就要同步模板注释）。 */
+const HEAVY_ROWS = new Set([
+  'tool-jobs',
+  'command-goal',
+  'tool-goal',
+  'planning',
+  'plan-mode',
+  'compaction',
+  'compaction-basic',
+  'command-compact',
+  'tool-result-pruner',
+  'delegation',
+  'tool-subagent-control',
+  'tool-subagent-list-agents',
+  'tool-subagent',
+  'tool-subagent-fork',
+  'tool-subagent-codex',
+  'tool-subagent-claude-code',
+  'workflow-worker-thread',
+  'tool-workflow',
+  'tool-ralph',
+])
+const stdMap = new Map(parsed.standard.rows.map((r) => [r.id, r]))
 
-  // 逐行核对 name / config
-  const stdMap = new Map(parsed.standard.rows.map((r) => [r.id, r]))
-  for (const row of parsed[key].rows) {
-    if (row.id === 'preset-md') continue
+for (const key of ['preset', 'tpl'].filter((k) => parsed[k])) {
+  const rows = parsed[key].rows
+  const ids = new Set(rows.map((r) => r.id))
+
+  // persona 必须缺席
+  for (const id of INTENTIONALLY_OMITTED) {
+    if (ids.has(id)) say('ERROR', `${key} 不该挂 ${id}（人格由 SYSTEM.md / IDENTITY.md 承载）`)
+  }
+  if ([...INTENTIONALLY_OMITTED].every((id) => !ids.has(id))) {
+    say('INFO', `${key} 未挂 persona（符合人格类预设预期）`)
+  }
+
+  // 重型机械不该出现
+  const heavy = [...ids].filter((id) => HEAVY_ROWS.has(id))
+  if (heavy.length) say('WARN', `${key} 挂了重型机械行（若是有意的，请更新本脚本与模板注释）：${heavy.join(', ')}`)
+  else say('INFO', `${key} 未挂 plan/compaction/委派 等重型机械行`)
+
+  // 模板里出现的官方行，name/config 应与官方一致
+  for (const row of rows) {
+    if (row.id === 'preset-md' || row.id === 'mnemon') continue
     const s = stdMap.get(row.id)
-    if (!s) continue
+    if (!s) {
+      say('WARN', `${key}/${row.id} 在官方 standard 里没有同名行（自研或拼错？）`)
+      continue
+    }
     if (s.name !== row.name) say('ERROR', `${key}/${row.id} name 不一致：${row.name} != ${s.name}`)
     if (JSON.stringify(s.config ?? null) !== JSON.stringify(row.config ?? null) && row.config !== undefined) {
       say('WARN', `${key}/${row.id} config 与官方不同`)
     }
+  }
+  say('INFO', `${key} 共 ${rows.length} 行，其中自研/额外行：${[...ids].filter((id) => !stdMap.has(id)).join(', ') || '（无）'}`)
+}
+
+// 2b. 模板与「本机预设」的行清单应保持一致（同步过的两份不该漂移）
+if (parsed.preset && parsed.tpl) {
+  const tplIds = new Set(parsed.tpl.rows.map((r) => r.id))
+  const presetIds = new Set(parsed.preset.rows.map((r) => r.id))
+  const onlyTpl = [...tplIds].filter((id) => !presetIds.has(id))
+  const onlyPreset = [...presetIds].filter((id) => !tplIds.has(id))
+  if (onlyTpl.length || onlyPreset.length) {
+    say('WARN', `tpl 与本机预设行清单不同：仅 tpl 有 [${onlyTpl.join(', ')}]，仅预设 有 [${onlyPreset.join(', ')}]`)
+  } else {
+    say('INFO', 'tpl 与本机预设行清单一致')
   }
 }
 
@@ -167,6 +217,9 @@ for (const [key, p] of Object.entries(parsed)) {
 for (const [key, p] of Object.entries(parsed)) {
   const missing = []
   for (const row of p.rows) {
+    // disabled 的行不会被启动，官方也不对它做存在性校验（见 dsh-agent-presets
+    // 的 unresolvableRows：`if (Boolean(row.disabled)) continue`）
+    if (row.disabled !== undefined && Boolean(row.disabled)) continue
     const m = /^@deepseek-ai\/([^/]+)/.exec(row.name ?? '')
     if (!m) continue
     if (!existsSync(join(NM, m[1]))) missing.push(`${row.id}->${row.name}`)

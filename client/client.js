@@ -61,6 +61,7 @@ window.__ModuleLoader__.load({
       '.pmd-textarea:focus{outline:none;border-color:var(--dsw-alias-brand-primary,#4a7dff)}',
       '.pmd-hint{color:var(--dsw-alias-label-tertiary,#6b6b6b)}',
       '.pmd-err{color:var(--dsw-alias-state-error-primary,#c0392b)}',
+      '.pmd-ok{color:var(--dsw-alias-state-success-primary,#2f9e44)}',
       '.pmd-field{display:flex;flex-direction:column;gap:6px}',
       '.pmd-field-label{color:var(--dsw-alias-label-secondary,#6b6b6b);font-size:12px;font-weight:500}',
       '.pmd-set-row{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;min-width:0;min-height:52px;padding:8px 0;border-top:1px solid var(--dsw-alias-border-l2,#e5e5e5);color:var(--dsw-alias-label-primary,#1f1f1f);font-size:13px;line-height:1.5}',
@@ -194,59 +195,118 @@ window.__ModuleLoader__.load({
     /* ────────────────────────── 参数 TAB ────────────────────────── */
 
     function ParamsTab() {
-      const [settings, setSettings] = React.useState(null)
+      /** 服务端的值（保存成功后才更新）。 */
+      const [saved, setSaved] = React.useState(null)
       const [message, setMessage] = React.useState('')
-      // 数字输入框的原始文本：清空时不能直接 Number('')（= 0），
-      // 否则阈值退化成「每轮都触发」。留原文，只在解析出合法值时才更新 settings。
-      const [drafts, setDrafts] = React.useState({})
+      /**
+       * 编辑中的表单值。`null` = 还没编辑过，显示服务端的值。
+       *
+       * 改完**不立即生效**：攒在草稿里，点「保存」才提交（与 dsh-memory-md 一致）。
+       * 这样一次只打一个接口、也不会出现「改到一半已经生效」的中间态。
+       */
+      const [draft, setDraft] = React.useState(null)
+      const [saving, setSaving] = React.useState(false)
 
-      React.useEffect(() => {
-        call('/settings').then((data) => setSettings(data.settings)).catch((error) => setMessage(String(error.message)))
+      /**
+       * 拉一次服务端值。
+       *
+       * 抽成 useCallback 是为了让「保存失败」也能复用：失败时重新读一次，
+       * 把服务端基线纠正回真实值。草稿（draft）不受影响，用户的编辑仍在，
+       * 只是 dirty 会按最新基线重新判定。
+       */
+      const load = React.useCallback(() => {
+        call('/settings')
+          .then((data) => setSaved(data.settings))
+          .catch((error) => setMessage(String(error.message)))
       }, [])
 
-      if (!settings) return h('div', { className: 'pmd-hint' }, message || '加载中…')
+      React.useEffect(() => { load() }, [load])
+
+      if (!saved) return h('div', { className: 'pmd-hint' }, message || '加载中…')
+
+      /*
+       * 表单值一律转成字符串：数字框要能承载「空」这个状态
+       * （空 = 用默认值），而服务端返回的是 number。
+       */
+      const form = draft ?? {
+        autoMemory: saved.autoMemory,
+        reviewTurns: String(saved.reviewTurns ?? ''),
+        reviewChars: String(saved.reviewChars ?? ''),
+        contextBudget: String(saved.contextBudget ?? ''),
+        budgetNotice: saved.budgetNotice,
+      }
+      const patch = (part) => setDraft({ ...form, ...part })
+
+      /** 表单里有没有未保存的改动。 */
+      const dirty =
+        form.autoMemory !== saved.autoMemory ||
+        form.reviewTurns !== String(saved.reviewTurns ?? '') ||
+        form.reviewChars !== String(saved.reviewChars ?? '') ||
+        form.contextBudget !== String(saved.contextBudget ?? '') ||
+        form.budgetNotice !== saved.budgetNotice
 
       const toggle = (key) => h('button', {
         type: 'button',
         role: 'switch',
-        'aria-checked': Boolean(settings[key]),
-        className: 'pmd-switch' + (settings[key] ? ' pmd-switch-on' : ''),
-        onClick: () => setSettings({ ...settings, [key]: !settings[key] }),
+        'aria-checked': Boolean(form[key]),
+        'aria-label': key,
+        className: 'pmd-switch' + (form[key] ? ' pmd-switch-on' : ''),
+        onClick: () => patch({ [key]: !form[key] }),
       }, h('span', { className: 'pmd-thumb' }))
 
+      /**
+       * 数字参数：标签在上、输入在下。
+       *
+       * 刻意**不把默认值写进标签或 placeholder**（与 dsh-memory-md 一致）：
+       * 输入框留空即代表「用默认值」，由服务端归一化兜底。界面上不出现具体数字，
+       * 默认值将来要调整也不必改文案。
+       */
       const num = (key, label, min, step, unit, gated = true) => {
         // gated：是否受「自动记忆」总开关支配。注入预算与自动记忆无关，不该跟着变灰。
-        const disabled = gated && !settings.autoMemory
-        const shown = drafts[key] !== undefined ? drafts[key] : String(settings[key])
-        const onInput = (event) => {
-          const raw = event.target.value
-          setDrafts({ ...drafts, [key]: raw })
-          const parsed = Number(raw)
-          // 空串 / 非数字 / 低于下限 → 不回写 settings，等用户改对
-          if (raw.trim() === '' || !Number.isFinite(parsed) || parsed < min) return
-          setSettings({ ...settings, [key]: Math.floor(parsed) })
-        }
+        const disabled = gated && !form.autoMemory
         return h('label', { key },
           unit ? `${label}（${unit}）` : label,
           h('input', {
             type: 'number',
             min,
             step,
-            value: shown,
+            value: form[key],
             disabled,
-            onChange: onInput,
-            onBlur: () => setDrafts({ ...drafts, [key]: undefined }),
+            // 原样保留用户输入（含空串）：不在 onChange 里做归一化，
+            // 归一化只在服务端做，避免「边打字边被改写」。
+            onChange: (event) => patch({ [key]: event.target.value }),
           }))
       }
 
+      /** 把草稿提交给服务端。归一化只在服务端做，这里不重复实现。 */
       const save = async () => {
+        setSaving(true)
+        setMessage('')
         try {
-          const data = await call('/settings', json('PUT', settings))
-          setSettings(data.settings)
-          setDrafts({})
+          const data = await call('/settings', json('PUT', {
+            autoMemory: form.autoMemory,
+            /*
+             * ⚠️ 清空时提交 **null**，不能提交 undefined ——
+             * `JSON.stringify({k: undefined})` 会把键整个丢掉，服务端收到的是空对象，
+             * 于是「清空即用默认」根本不会发生（用户以为重置了，实际没变）。
+             * `normalizeSetting` 把 null 当「回落默认」处理。
+             */
+            reviewTurns: form.reviewTurns.trim() === '' ? null : Number(form.reviewTurns),
+            reviewChars: form.reviewChars.trim() === '' ? null : Number(form.reviewChars),
+            contextBudget: form.contextBudget.trim() === '' ? null : Number(form.contextBudget),
+            budgetNotice: form.budgetNotice,
+          }))
+          setSaved(data.settings)
+          setDraft(null)
           setMessage('已保存，立即生效。')
         } catch (error) {
           setMessage(`保存失败：${error.message}`)
+          // 重新拉一次服务端值：万一后端已经写进去了一部分（或并发的另一次保存
+          // 成功了），这里显示的基线就会是脏的。重新读一遍纠正它。
+          // 不动 draft —— 用户的编辑必须留着，否则一次失败就把输入吞掉了。
+          load()
+        } finally {
+          setSaving(false)
         }
       }
 
@@ -258,24 +318,20 @@ window.__ModuleLoader__.load({
 
       // 后端还没返回预算字段时（旧进程）不显示 NaN，只留比例说明。
       // 这段并入「超限提醒」开关的说明里，不单独占一行——否则会把开关行的右端挤出对齐。
-      const budgetChars = Number(settings.contextBudget)
+      const budgetChars = Number(saved.contextBudget)
       const budgetKnown = Number.isFinite(budgetChars) && budgetChars > 0
       const budgetHint = (budgetKnown ? `当前 ${budgetChars} 字符 ≈ ${Math.round(budgetChars * 0.47)} token。` : '') +
         '各文件按固定比例瓜分这份预算（MEMORY 25% / AGENTS 22% / SOUL 20% / IDENTITY 13% / SYSTEM 12% / USER 8%），' +
         '单个文件偏大但总量没超不会提示。'
 
       return h('div', { className: 'pmd-root' },
-        h('div', { className: 'pmd-hint' }, '这些开关即时生效：运行中的会话下一个回合就会按新值走。'),
+        h('div', { className: 'pmd-hint' }, '改动点「保存」后生效；运行中的会话下一个回合就会按新值走。'),
         h('div', { className: 'pmd-perm' },
           setRow('autoMemory', '自动记忆',
             '开：后台自动整理日记、更新记忆。关：不写日记也不动记忆，只有手动检索可用。'),
           h('div', { className: 'pmd-fields' },
             num('reviewTurns', '触发轮数', 1, undefined, '轮'),
             num('reviewChars', '触发字符数', 200, 200, '字符')),
-          setRow('freeze', '会话内冻结提示词',
-            '开：同一会话只读一次文件，改动需新开对话。关：每一步都重新读文件，改完立即生效。'),
-          setRow('complete', '独占系统提示词',
-            '开：系统提示词只保留本插件的 MD 内容，官方内置提示和其它插件注入的提示全部丢弃。关：都保留，一起生效。'),
           h('div', { className: 'pmd-sep' }),
           h('div', { className: 'pmd-fields pmd-fields-single pmd-fields-lg' },
             num('contextBudget', '注入预算', 2000, 1000, '字符', false)),
@@ -283,8 +339,15 @@ window.__ModuleLoader__.load({
             '开：六个文件总量超出预算时，在提示词末尾附一段「请收敛」提醒，让模型自己精简。' +
             '关：只度量并打日志，不往提示词里加任何东西。两种情况都不硬截断。' + budgetHint)),
         h('div', { className: 'pmd-row' },
-          h('button', { className: 'pmd-btn pmd-btn-primary', type: 'button', onClick: save }, '保存'),
-          h('span', { className: 'pmd-hint' }, message)),
+          h('button', {
+            className: 'pmd-btn pmd-btn-primary',
+            type: 'button',
+            // 有未保存改动时才可点，避免无谓的接口调用。
+            disabled: saving || !dirty,
+            onClick: () => { void save() },
+          }, saving ? '保存中…' : '保存'),
+          dirty && !saving ? h('span', { className: 'pmd-hint' }, '有未保存的改动') : null,
+          message ? h('span', { className: dirty ? 'pmd-hint' : 'pmd-ok' }, message) : null),
       )
     }
 

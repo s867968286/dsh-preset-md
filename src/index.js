@@ -414,10 +414,6 @@ export function registerRoutes(ctx, home) {
         await writeAgentFile(paths, id, body.file, body.content)
         return sendJson(res, 200, { ok: true })
       }
-      if (sub === '/upgrade' && method === 'POST') {
-        const result = upgradeToPresetMd(paths, id)
-        return sendJson(res, 200, { ok: true, ...result })
-      }
       if (sub === '/journal' && method === 'GET') return sendJson(res, 200, { journal: listJournal(paths, id) })
       const journalMatch = /^\/journal\/(\d{4}-\d{2}-\d{2})$/.exec(sub)
       if (journalMatch && method === 'GET') {

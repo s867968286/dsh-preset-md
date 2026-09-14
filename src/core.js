@@ -10,7 +10,9 @@
  * 关键设计：
  * - 内容放在**变量值**里、section 文本只写 `{{preset_md}}`：变量值不会再被插值，
  *   因此 MD 正文里出现 `{{xxx}}` 也不会触发严格解析抛错。
- * - 冻结：变量 provider 首次求值后缓存，之后每步返回同一份文本（改文件要新开会话）。
+ * - 冻结：变量 provider 每步都会被官方调用，但首次求值后缓存，之后每步返回
+ *   **同一份文本**（改文件要新开会话）。我们不做任何「文件是否变了」的探测 ——
+ *   见下方 registerPrompt 里 read / cacheKeyOf 的说明。
  * - 目录取 ctx.baseUrl（预设组合所在目录）。
  */
 import { existsSync, readFileSync } from 'node:fs'
@@ -110,12 +112,36 @@ export function sessionKeyOf(input) {
  * 直接读 `session.events` 永远得到 `undefined`：转写恒为空，
  * 回顾每次都判定 `turn_too_short` 跳过，自动日记永远写不出来。
  *
- * 取用顺序：`snapshotEvents()`（全量，含 fork 继承前缀）→ `events` 数组兜底
- * （兼容假 ctx / 旧形态）→ `ownEvents()`（只含本会话自己的事件）。
+ * ## 为什么 `ownEvents()` 优先，而不是 `snapshotEvents()`
+ *
+ * 官方契约（`dsh-session/lib/types/index.d.ts`）：
+ * - `snapshotEvents()` —— **全量，含 fork 继承前缀**（"a full current snapshot"）
+ * - `ownEvents()` —— "this Session's events **after its fork-inherited prefix**"，
+ *   即只含本会话自己产生的事件
+ *
+ * 子代理（subagent）会话是通过 fork 派生的，磁盘上**确实带着父会话的完整历史**
+ * （实测本机 7 个 presetmd 子会话，`seedLength` 4640～68054，其事件流前数百条
+ * 全是父会话内容）。用 `snapshotEvents()` 会把这些当成"本会话发生的事"：
+ *
+ * - **触发阈值被灌满**：`grown` 在会话第一轮就把整个继承前缀算成「新增」，
+ *   于是每个 fork 出来的子会话**第 1 轮必然越线触发**回顾。实测这些子会话的
+ *   转写有 **90%～99%** 是父会话内容（仅自有段 95～113 字符，全量 4363～7889）。
+ * - **回顾内容失真**：总结的是"父会话做了什么"，而不是本会话做了什么。
+ *
+ * 所以取用顺序为：`ownEvents()`（只含自有）→ `snapshotEvents()`（全量兜底）
+ * → `events` 数组（兼容假 ctx / 旧形态）。
  * 任何一步失败都静默落到下一档，最终返回空数组而不是抛错。
  */
 export function sessionEvents(session) {
   if (!session || typeof session !== 'object') return []
+  try {
+    if (typeof session.ownEvents === 'function') {
+      const events = session.ownEvents()
+      if (Array.isArray(events)) return events
+    }
+  } catch {
+    /* 落到兜底 */
+  }
   try {
     if (typeof session.snapshotEvents === 'function') {
       const events = session.snapshotEvents()
@@ -125,18 +151,27 @@ export function sessionEvents(session) {
     /* 落到兜底 */
   }
   if (Array.isArray(session.events)) return session.events
-  try {
-    if (typeof session.ownEvents === 'function') {
-      const events = session.ownEvents()
-      if (Array.isArray(events)) return events
-    }
-  } catch {
-    /* 无事件可取 */
-  }
   return []
 }
 
-/** 会话级文本缓存：首次取值后冻结，直到显式清理。 */
+/**
+ * 会话级文本缓存：首次取值后冻结，直到显式清理。
+ *
+ * ## 为什么是 `Map` + 字符串键，而不是官方的 `WeakMap` + 会话对象
+ *
+ * 官方同类缓存用 `WeakMap` 以**会话对象**为键（如 `dsh-agent-instructions`
+ * 的 `instructionVersions`），好处是会话销毁后自动回收、无需手工清理。
+ * 我们没这么做，有两个具体原因：
+ *
+ * 1. **要支持「拿不到会话」的兜底键**。`cacheKeyOf` 在取不到会话 id 时会退化
+ *    成 `__no_session__:<cwd>:<presetDir>`（避免不同工作区的 `{{cwd}}` 串味）。
+ *    那是**字符串**键，`WeakMap` 只接受对象，做不到。
+ * 2. **清理时机由我们掌握**。会话结束时（`agent/disposed`）显式 `clear(key)`，
+ *    与 `states`、提示词缓存用同一套生命周期，行为可预期、可单测。
+ *
+ * 代价是必须记得清理，否则 Map 会随会话数增长。清理点见 `preset.js` 的
+ * `agent/disposed` 处理（`prompt.cache.clear(key)`）。
+ */
 export function createSessionFreeze() {
   const cache = new Map()
   return {
@@ -333,34 +368,49 @@ export function substitutePlaceholders(text, facts) {
 }
 
 /**
- * 注册提示词：变量承载内容 + 唯一 section（可选 complete）+ 会话冻结。
+ * 注册提示词：变量承载内容 + 唯一 complete section + 会话内冻结。
  *
  * 文件清单、目录、截断策略全部硬编码；只有 tools 是配置项。
  *
- * @param {object} ctx - dsh 上下文（需要 systemPrompt；可选 effect / logger）。
- * @param {{freeze?: boolean, complete?: boolean, variable?: string, sectionName?: string, order?: number, budgetChars?: number, budgetNotice?: boolean, getSettings?: () => object, onRender?: (settings: object) => void}} [options]
- * @returns {{dir: string, files: Array<object>, cache: object, freeze: boolean, variable: string, sectionName: string, order: number, complete: boolean, getSettings: () => object, registerSection: (complete: boolean) => () => void, sectionDisposer: () => void}}
+ * **两个开关已移除**（原本是设置项）：`complete`（独占系统提示词）与
+ * `freeze`（会话内冻结）。它们只是「可切换」，而我们始终只用一种模式 ——
+ * 独占（本插件的 MD 就是全部系统提示词）+ 冻结（同一会话读盘一次）。
+ * 移除后连带砍掉了整块「运行时撤旧建新 section」的机制：那套存在的原因只是
+ * `complete` 会变；固定之后 section 只需注册一次。
+ *
+ * @param {object} ctx - dsh 上下文（需要 systemPrompt）。
+ * @param {{variable?: string, sectionName?: string, order?: number, getSettings?: () => object}} [options]
+ * @returns {{dir: string, files: Array<object>, cache: object, variable: string, sectionName: string, order: number, getSettings: () => object}}
  */
 export function registerPrompt(ctx, options = {}) {
   const dir = resolvePresetDir(ctx)
   const variable = options.variable ?? PROMPT_VARIABLE
   const sectionName = options.sectionName ?? PROMPT_SECTION
   const order = Number.isFinite(options.order) ? options.order : PROMPT_ORDER
-  // 实时读取设置：调用方可传入 getSettings，让 freeze / contextBudget / budgetNotice
-  // 在每次渲染时取最新值（参数改动无需重启或新开会话即可生效）。
-  // 未提供时回退到 options 上的静态值（保持旧的调用方式与单测兼容）。
-  const getSettings = typeof options.getSettings === 'function'
-    ? options.getSettings
-    : () => ({
-        freeze: options.freeze,
-        complete: options.complete,
-        contextBudget: options.budgetChars,
-        budgetNotice: options.budgetNotice,
-      })
+  // 实时读取设置：只有注入预算与超限提醒还留在设置页，它们每次渲染取最新值。
+  const getSettings = typeof options.getSettings === 'function' ? options.getSettings : () => ({})
   const cache = createSessionFreeze()
 
   /**
-   * 变量 provider：每步被调用；冻结开启时同一会话只读盘一次。
+   * 变量 provider：**每步都会被官方调用**，但我们只让它读一次盘。
+   *
+   * ## 为什么需要缓存（而不是「第一次注入后就完事」）
+   *
+   * 官方装配流程是：`assemble()` → 收集所有变量的 provider → 渲染 section →
+   * 作为**请求的第一个 message** 发给模型。`assemble()` 在**每个 pre-step**
+   * 都会跑（`dsh-agent-loop` 的 `preStep`），所以 provider 是「每步都问一次
+   * 『你现在要注入什么』」，而不是「只问一次、之后不再需要」。
+   *
+   * 既然每步都问，就必须保证**答案逐字节一致**：系统提示词是请求前缀，
+   * 它一变，后面所有内容都失去 KV 缓存命中（实测：MD 若每次重读，改动会让
+   * 36.8k 字符里仅 50 字符可复用）。所以这里冻结成「同一会话只读一次盘」。
+   *
+   * ## 我们不做变化检测
+   *
+   * 官方同类实现（如 `dsh-agent-instructions`）会缓存文件版本元数据、主动比对
+   * 是否变化，以便**感知**改动。我们的意图相反：**会话内故意不感知变化**——
+   * 改 Markdown 要新开对话才生效（见 README「固定行为」）。我们只负责返回恒定
+   * 文本，是否重发、如何复用缓存全部交给官方判断，自己不做任何变更探测。
    *
    * 缓存键：优先用会话 id。取不到 id 时**不能退化成单一常量键** ——
    * 那样所有拿不到 id 的会话会共用第一份渲染结果，`{{cwd}}` 之类的替换值会串味。
@@ -373,52 +423,33 @@ export function registerPrompt(ctx, options = {}) {
     return `__no_session__:${facts.cwd || '-'}:${facts.presetDir || '-'}`
   }
 
-  /**
-   * 注册 section（文本只引用变量：MD 正文里的 {{…}} 不会被插值解析）。
-   * complete 是结构性参数：切换时必须先 dispose 旧 section 再注册新的，
-   * 否则同名 section 重复注册会抛错。返回 disposer，供 read() 重建。
+  /*
+   * 注册唯一 section：`complete: true` 表示「系统提示词只保留本段」，
+   * 文本只引用变量 —— MD 正文放在变量右值里，官方 interpolate() 不二次扫描，
+   * 所以正文里的 `{{…}}` 不会被当真变量解析（见 substitutePlaceholders 的说明）。
+   *
+   * 只注册一次：complete 不再可切换，没有「撤旧建新」的需要。
    */
-  const registerSection = (complete) => {
-    const section = { name: sectionName, order, text: `{{${variable}}}` }
-    if (complete === true) section.complete = true
-    if (typeof ctx.effect === 'function') {
-      return ctx.effect(() => ctx.systemPrompt.section(section), `preset-md.section(${sectionName})`)
-    }
-    return ctx.systemPrompt.section(section)
-  }
+  ctx.systemPrompt.section({ name: sectionName, order, text: `{{${variable}}}`, complete: true })
 
-  const initial = getSettings() || {}
-  const initialComplete = initial.complete === true
-  const initialFreeze = initial.freeze !== false
-  const initialBudget = Number.isFinite(initial.contextBudget) && initial.contextBudget > 0 ? initial.contextBudget : DEFAULT_CONTEXT_BUDGET
-  const initialBudgetNotice = initial.budgetNotice !== false
-
-  // 当前生效的 section 及其 disposer：complete 变化时由 read() 撤旧建新
-  let currentComplete = initialComplete
-  let sectionDisposer = registerSection(initialComplete)
-
+  /**
+   * 渲染正文。
+   *
+   * **缓存边界**：`cache.get` 包住的是「读 MD + 占位符替换 + 超限提醒」**整段**。
+   * 也就是说注入预算与「超限提醒」开关**也**被冻结 —— 同一会话内改了它们，
+   * 要新开会话才生效。这么做是为了让系统提示词在会话内**逐字节恒定**
+   * （它是请求前缀，一变则后面全部丢失 KV 缓存命中），代价写进了 README。
+   *
+   * `getSettings()` 仍留在缓存外：它每步都会被调用（实测缓存命中时每步同步读
+   * 一次 `settings.json`），但结果只用于决定**是否重新渲染**——命中时该值不参与
+   * 输出。保留这次读盘是为了让「新会话」立刻取到最新设置，而不必等插件重启。
+   */
   const read = (context) => {
     if (!dir) return ''
     const s = getSettings() || {}
-    // 每次渲染实时通知设置快照，让调用方能按需重建结构性参数（complete 等）
-    if (typeof options.onRender === 'function') options.onRender(s)
-    // complete 是结构性参数：设置变化时必须「先撤旧、再注册新」。
-    // 同名 section 在同一 scope 重复注册会直接抛错，不能只注册不撤销。
-    // 变量 provider 在 assemble 中先于 section 收集执行，所以这里重建能在本步生效。
-    const wantComplete = s.complete === true
-    if (wantComplete !== currentComplete) {
-      try {
-        sectionDisposer?.()
-        sectionDisposer = registerSection(wantComplete)
-        currentComplete = wantComplete
-      } catch {
-        /* 重建失败就保持旧 section，不让提示词组装整个挂掉 */
-      }
-    }
-    const freeze = s.freeze !== false
     const budgetChars = Number.isFinite(s.contextBudget) && s.contextBudget > 0 ? s.contextBudget : DEFAULT_CONTEXT_BUDGET
     const budgetNotice = s.budgetNotice !== false
-    const produce = () => {
+    return cache.get(cacheKeyOf(context), () => {
       const body = substitutePlaceholders(readAggregateText(dir), contextFacts(context, dir))
       // 整体超预算时追加一段「请收敛」提示；超限判断发生在替换之后，
       // 因为 {{presetDir}} 之类的替换值也会占体积。
@@ -426,9 +457,7 @@ export function registerPrompt(ctx, options = {}) {
       if (!budgetNotice) return body
       const notice = contextBudgetNotice(measureContext(dir, { budgetChars }), { warnAt: Number.isFinite(options.warnAt) ? options.warnAt : 1 })
       return notice ? `${body}\n\n${notice}` : body
-    }
-    if (!freeze) return produce()
-    return cache.get(cacheKeyOf(context), produce)
+    })
   }
   ctx.systemPrompt.variable(variable, read)
 
@@ -441,17 +470,11 @@ export function registerPrompt(ctx, options = {}) {
     dir,
     files,
     cache,
-    freeze: initialFreeze,
     variable,
     sectionName,
     order,
-    complete: initialComplete,
-    budgetChars: initialBudget,
-    budgetNotice: initialBudgetNotice,
     cacheKeyOf,
     getSettings,
-    registerSection,
-    sectionDisposer,
   }
 }
 

@@ -21,12 +21,12 @@ import {
   readPresetMeta,
   readSettings,
   resolvePaths,
-  usesPresetMd,
   writeAgentFile,
   writePresetMeta,
   writeSettings,
 } from '../src/index.js'
 import { PRESET_FILES, agentCordisTemplate, renderAllTemplates, renderTemplate } from '../src/templates.mjs'
+import { DEFAULT_FILES } from '../src/core.js'
 
 /** 建一个临时的 dshHome 并返回 paths。 */
 function makeHome() {
@@ -191,14 +191,52 @@ test('renderTemplate：昵称/用户名里的 $ 不被当成替换模式', () =>
   assert.ok(normal.includes('你是 莉莉，鹏哥 的个人助手。'))
 })
 
-test('renderAllTemplates / agentCordisTemplate：六个文件都被渲染，不留占位符', () => {
+test('renderAllTemplates / agentCordisTemplate：模板都能渲染，不留占位符', () => {
   const all = renderAllTemplates({ name: '测试', userName: '老王' })
   assert.deepEqual(Object.keys(all).sort(), PRESET_FILES.map((item) => item.file).sort())
   for (const [file, text] of Object.entries(all)) {
     assert.ok(!text.includes('{name}'), `${file} 不应残留 {name}`)
     assert.ok(!text.includes('{user}'), `${file} 不应残留 {user}`)
   }
-  assert.ok(agentCordisTemplate('测试').includes('测试'))
+  /*
+   * agent.cordis.yml 模板**不带**昵称占位符：昵称由 preset.yml 与 IDENTITY.md 承载，
+   * 预设行文件只是插件行清单（与线上预设逐字节一致，便于对照）。
+   * 所以这里断言它被完整读出、且同样不含残留占位符。
+   */
+  const cordis = agentCordisTemplate('测试')
+  assert.ok(cordis.includes('- id: preset-md'), 'cordis 模板应含 preset-md 行')
+  assert.ok(!cordis.includes('{name}'), 'cordis 模板不应残留 {name}')
+  assert.ok(!cordis.includes('{user}'), 'cordis 模板不应残留 {user}')
+})
+
+test('agent.cordis.yml 模板是人格类预设：不含编码 agent 的重型机械，也不挂 persona', () => {
+  /*
+   * 这是**有意的取舍**，不是遗漏：人格类预设只需要对话的基础工具，
+   * plan mode / compaction / 委派与工作流 / goal / jobs 那套重型机械会把
+   * 工具目录撑大、并诱导模型走工程流程，对陪伴场景是负担。
+   *
+   * 这条锁住取舍本身——将来有人「顺手对齐官方 standard」时会被挡下，
+   * 要改就得先改这里和模板注释（以及 README）。
+   */
+  const text = agentCordisTemplate('测试')
+  const ids = [...text.matchAll(/^- id:[ \t]*(\S+)/gm)].map((m) => m[1])
+
+  // 基础工具必须在
+  for (const id of ['preset-md', 'tool-bash', 'tool-pwsh', 'tool-fs', 'tool-fs-search', 'tool-skill', 'tool-ask-user', 'tool-todo', 'tool-web']) {
+    assert.ok(ids.includes(id), `人格类预设应保留基础工具 ${id}`)
+  }
+
+  // 重型机械不该在
+  for (const id of ['planning', 'plan-mode', 'compaction', 'delegation', 'tool-subagent', 'tool-workflow', 'tool-ralph', 'tool-jobs', 'tool-goal', 'command-goal']) {
+    assert.ok(!ids.includes(id), `人格类预设不该挂 ${id}（重型机械，见模板注释）`)
+  }
+
+  // 不挂 persona：官方 persona 的 "You are a coding agent ..." 会盖掉人格
+  assert.ok(!ids.includes('persona'), '人格由 SYSTEM.md / IDENTITY.md 承载，不挂官方 persona 行')
+
+  // preset-md 行要带工具收窄配置（关掉第三方记忆插件的工具）
+  assert.match(text, /- id: preset-md[\s\S]{0,200}deny:/, 'preset-md 行应带 tools.deny 收窄')
+  assert.match(text, /'mnemon\*'/, '应关掉 mnemon 的工具，避免两套记忆系统打架')
 })
 
 test('listAgents：按 order 升序', () => {
@@ -294,17 +332,14 @@ test('listJournal / readJournal：非法 id 也拒绝（防路径穿越）', () 
   rmSync(home, { recursive: true, force: true })
 })
 
-test('usesPresetMd：识别 preset 行，含行尾注释', () => {
+test('createAgent：新建的伙伴带 preset-md 注入行', () => {
+  // 这条原来通过已删除的 usesPresetMd() 断言，改成直接读文件——
+  // 「新建伙伴要能直接生效」这个行为本身仍值得锁住。
   const { home, paths } = makeHome()
   const agent = createAgent(paths, { name: 'W' })
-  const file = join(paths.presetsRoot, agent.id, 'agent.cordis.yml')
-  assert.equal(usesPresetMd(join(paths.presetsRoot, agent.id)), true, '新建的伙伴应带 preset 行')
-
-  writeFileSync(file, '- id: preset-md  # 注入提示词\n  name: dsh-preset-md/preset\n', 'utf8')
-  assert.equal(usesPresetMd(join(paths.presetsRoot, agent.id)), true, '行尾注释不能导致误判')
-
-  writeFileSync(file, "- id: tool-fs\n  name: '@deepseek-ai/dsh-tool-fs'\n", 'utf8')
-  assert.equal(usesPresetMd(join(paths.presetsRoot, agent.id)), false)
+  const text = readFileSync(join(paths.presetsRoot, agent.id, 'agent.cordis.yml'), 'utf8')
+  assert.match(text, /^[ \t]*-[ \t]*id:[ \t]*preset-md[ \t]*$/m, '新建的伙伴应带 preset 行')
+  assert.match(text, /name:[ \t]*dsh-preset-md\/preset/, '行名要指向 preset 子路径入口')
   rmSync(home, { recursive: true, force: true })
 })
 
@@ -337,6 +372,42 @@ test('writeAgentFile：非法 id / 白名单外仍同步抛错', () => {
   rmSync(home, { recursive: true, force: true })
 })
 
+test('三条文件清单必须一致：core.DEFAULT_FILES / templates.PRESET_FILES / client.MD_TABS', () => {
+  /*
+   * 「六个 MD 文件」这份清单在源码里存在**三处**：
+   *   src/core.js:37   DEFAULT_FILES    —— 拼系统提示词用（只要文件名）
+   *   src/templates.mjs PRESET_FILES    —— 生成模板 + Host 白名单（文件 + 中文标签）
+   *   client/client.js  MD_TABS         —— 设置页页签（文件 + 中文标签）
+   *
+   * 三处各写一份、谁都不锁谁。实测后果：把 client 的 `AGENTS.md` 改成
+   * `AGENTS_TYPO.md`，159 条测试**全部通过**——设置页会去读一个不存在的文件，
+   * 而没有任何测试能发现。这正是「同一份数据多处硬编码」的典型代价。
+   *
+   * 这条把三者锁在一起：任一处漂移、增删文件、或顺序错位都会立刻红。
+   */
+  const clientSource = readFileSync(
+    new URL('../client/client.js', import.meta.url), 'utf8',
+  )
+  const tabs = [...clientSource.matchAll(/\{ file: '([A-Z]+\.md)', label: '([^']+)' \}/g)]
+    .map((m) => ({ file: m[1], label: m[2] }))
+
+  assert.deepEqual(
+    tabs.map((t) => t.file),
+    DEFAULT_FILES,
+    'client 的页签文件必须与 core.DEFAULT_FILES 完全一致（含顺序）',
+  )
+  assert.deepEqual(
+    PRESET_FILES.map((item) => item.file),
+    DEFAULT_FILES,
+    'templates.PRESET_FILES 必须与 core.DEFAULT_FILES 一致',
+  )
+  assert.deepEqual(
+    tabs,
+    PRESET_FILES.map((item) => ({ file: item.file, label: item.label })),
+    'client 的页签标签必须与 templates.PRESET_FILES 一致（否则设置页与模板文案会打架）',
+  )
+})
+
 test('设置：缺失回落默认、部分更新只改给到的键', () => {
   const { home, paths } = makeHome()
   assert.deepEqual(readSettings(paths), DEFAULT_SETTINGS)
@@ -364,7 +435,12 @@ test('设置：越界/错误类型回落到默认值（0 会让每轮都触发�
 
   // 布尔键只接受真布尔：字符串 "false" 是真值，会让开关静默失效
   assert.equal(writeSettings(paths, { autoMemory: 'false' }).autoMemory, DEFAULT_SETTINGS.autoMemory)
-  assert.equal(writeSettings(paths, { freeze: 'no' }).freeze, DEFAULT_SETTINGS.freeze)
+  assert.equal(writeSettings(paths, { budgetNotice: 'no' }).budgetNotice, DEFAULT_SETTINGS.budgetNotice)
+
+  // 已移除的开关（freeze / complete）不该再出现在设置里 —— 传了也不落盘
+  const afterRemoved = writeSettings(paths, { freeze: true, complete: true })
+  assert.ok(!('freeze' in afterRemoved), 'freeze 已移除，不该被写入设置')
+  assert.ok(!('complete' in afterRemoved), 'complete 已移除，不该被写入设置')
 
   // 合法值正常生效，小数向下取整
   assert.equal(writeSettings(paths, { reviewTurns: 7.9 }).reviewTurns, 7)

@@ -178,7 +178,7 @@ export function apply(ctx, rawConfig) {
    */
   const getSettings = () => readSettings(paths)
 
-  /* 提示词：变量承载内容 + 唯一 section（可 complete）+ 会话冻结 */
+  /* 提示词：变量承载内容 + 唯一 complete section + 会话内冻结（固定行为，不可配） */
   const prompt = registerPrompt(ctx, {
     variable: PROMPT_VARIABLE,
     sectionName: PROMPT_SECTION,
@@ -225,8 +225,7 @@ export function apply(ctx, rawConfig) {
   const missing = prompt.files.filter((item) => !item.exists).map((item) => item.file)
   logger.info?.(
     `[preset-md] 装配 目录=${prompt.dir} | 参数 autoMemory=${startup.autoMemory} ` +
-      `reviewTurns=${startup.reviewTurns} reviewChars=${startup.reviewChars} ` +
-      `freeze=${startup.freeze} complete=${startup.complete} | ` +
+      `reviewTurns=${startup.reviewTurns} reviewChars=${startup.reviewChars} | ` +
       `section=${prompt.sectionName}(order ${prompt.order}, 变量 {{${prompt.variable}}}) | ` +
       `文件=${present.join('/') || '（无）'}${missing.length > 0 ? ` 缺:${missing.join(',')}` : ''}`,
   )
@@ -455,6 +454,18 @@ function registerAutoMemory(ctx, prompt, getSettings, logger) {
         } else {
           consumed = true
           const applied = (result.applied ?? []).join(', ')
+          /*
+           * 截断标记：即使这一轮写入了内容，撞上 max-tokens 也意味着**可能不完整**
+           * （例如 updates 被截掉、只写进了 journal）。单列一条 warn，别混在 info 里
+           * ——否则「日记写了但记忆没更新」这类现象查不出来。
+           */
+          if (result.truncated) {
+            logger.warn?.(
+              `[preset-md] 自动记忆输出被截断（finish=max-tokens，触发=${reason}，会话=${shortKey(key)}）：` +
+                `已写入 [${applied || '无'}]，但内容可能不完整（updates 可能被截掉）；` +
+                `考虑在下一条记忆里精简表达`,
+            )
+          }
           if (applied) {
             logger.info?.(`[preset-md] 自动记忆完成（触发=${reason}，会话=${shortKey(key)}）：${applied}`)
           } else if (result.journalEmpty) {

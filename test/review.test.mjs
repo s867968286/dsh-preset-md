@@ -9,7 +9,7 @@ import { join } from 'node:path'
 
 import { appendJournal, changelogPath, journalPath } from '../src/memory-store.mjs'
 import { INDEX_CLIP_CHARS, SEARCH_TOOL_NAME, clip, createSearchTool, searchJournal } from '../src/search.mjs'
-import { buildReviewInput, buildTranscript, callText, isHumanMessage, parseReviewJson, REVIEW_SYSTEM_PROMPT, runReview } from '../src/review.mjs'
+import { buildReviewInput, buildTranscript, callText, isHumanMessage, parseReviewJson, REVIEW_SYSTEM_PROMPT, runReview, TRANSCRIPT_TRUNCATED_MARK } from '../src/review.mjs'
 
 const makeDir = () => mkdtempSync(join(tmpdir(), 'preset-md-search-'))
 
@@ -122,15 +122,31 @@ test('createSearchTool：工具名带 preset_md_ 前缀，execute 返回文本',
 
 /* ───────────────────────────── 回顾 ───────────────────────────── */
 
-test('buildTranscript：只取 user/assistant 文本并截断尾部', () => {
+test('buildTranscript：只取 user/assistant 文本，超长保留尾部并标记省略', () => {
   const events = [
     { type: 'user/message', data: { content: [{ type: 'text', text: '你好' }], source: { kind: 'user' } } },
     { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '在的' }] } } },
     { type: 'tool/result', data: {} },
   ]
   assert.equal(buildTranscript(events), '用户：你好\n\n助手：在的')
-  const long = buildTranscript([{ type: 'user/message', data: { content: [{ type: 'text', text: 'x'.repeat(50) }], source: { kind: 'user' } } }], 10)
-  assert.equal(long.length, 10)
+
+  // 超长：保留**尾部**（本轮结论比开头更值得总结），并显式标记前文被省略。
+  // 静默 slice 会让人以为「这轮就这么点内容」，排查窗口截断时看不出来。
+  const long = buildTranscript(
+    [{ type: 'user/message', data: { content: [{ type: 'text', text: 'x'.repeat(50) }], source: { kind: 'user' } } }],
+    10,
+  )
+  assert.ok(long.startsWith(TRANSCRIPT_TRUNCATED_MARK), '超长必须带「前文略」标记')
+  assert.ok(long.endsWith('x'.repeat(10)), '正文必须是尾部（保留最新的内容）')
+
+  // 恰好不超限时不该加标记（避免每次回顾都带一条噪音）
+  const fits = '用户：' + 'x'.repeat(10)
+  const exact = buildTranscript(
+    [{ type: 'user/message', data: { content: [{ type: 'text', text: 'x'.repeat(10) }], source: { kind: 'user' } } }],
+    fits.length,
+  )
+  assert.equal(exact, fits)
+  assert.ok(!exact.includes(TRANSCRIPT_TRUNCATED_MARK))
 })
 
 test('buildTranscript / isHumanMessage：只有 source.kind=user 才算真人发言（回归）', () => {
@@ -294,6 +310,85 @@ test('runReview：模型没产出日志段落时打上 journalEmpty 标记', asy
   rmSync(dir, { recursive: true, force: true })
 })
 
+test('runReview：截断（max-tokens）时在告警里点明根因与输出长度', async () => {
+  /*
+   * 这是本次修的核心观测能力：解析失败的原因必须**可判定**。
+   * 「被硬截断」与「模型写了非 JSON 的散文」是两种不同故障，
+   * 处理方式也不同（前者该提上限/精简表达，后者该改 prompt），
+   * 而原来的日志只给一段自带 500 字符截断的原文，判不出来。
+   */
+  const dir = makeDir()
+  const events = [{ type: 'user/message', data: { content: [{ type: 'text', text: 'x'.repeat(200) }], source: { kind: 'user' } } }]
+  const warns = []
+  const ctx = llmCtx(() => (async function* () {
+    // 缺尾的 JSON —— 正是被硬截断的样子
+    yield { type: 'text-delta', text: '{"journal":"> 摘要：写了很长很长的一段，然后被切断了' }
+    yield { type: 'finish', reason: { kind: 'max-tokens' } }
+  })())
+
+  const result = await runReview({
+    ctx, dir, session: { events }, provider: 'p', model: 'm',
+    onWarn: (m) => warns.push(m),
+  })
+
+  assert.equal(result.truncated, true, '必须标记为截断')
+  assert.equal(result.finish, 'max-tokens', 'finish 原因要能取到')
+  const text = warns.join('\n')
+  assert.ok(text.includes('max-tokens'), '告警必须点明 finish=max-tokens')
+  assert.ok(text.includes('截断'), '告警要说明是被截断')
+  assert.ok(/输出 \d+ 字符/.test(text), '要带输出长度，便于和上限对比')
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('runReview：非截断的解析失败不该误报成截断', async () => {
+  // 反证：模型写了散文（finish=stop）时，告警里不能出现「截断」——
+  // 否则观测数据本身就是脏的，会把人往「提上限」的错误方向带。
+  const dir = makeDir()
+  const events = [{ type: 'user/message', data: { content: [{ type: 'text', text: 'x'.repeat(200) }], source: { kind: 'user' } } }]
+  const warns = []
+  const ctx = llmCtx(() => (async function* () {
+    yield { type: 'text-delta', text: '好的，这一轮没什么值得记的。' }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  })())
+
+  const result = await runReview({
+    ctx, dir, session: { events }, provider: 'p', model: 'm',
+    onWarn: (m) => warns.push(m),
+  })
+
+  assert.equal(result.truncated, false)
+  assert.equal(result.finish, 'stop')
+  const text = warns.join('\n')
+  assert.ok(!text.includes('截断'), `非截断不该说成截断：${text}`)
+  assert.ok(text.includes('finish=stop'), '仍要报出 finish 便于排查')
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('runReview：截断但 JSON 恰好解析成功时也要留痕', async () => {
+  /*
+   * 危险场景：journal 写完、updates 被截掉，JSON 恰好仍是完整对象。
+   * 此时「解析成功」会让人以为一切正常，实际记忆更新丢了。
+   */
+  const dir = makeDir()
+  const events = [{ type: 'user/message', data: { content: [{ type: 'text', text: 'x'.repeat(200) }], source: { kind: 'user' } } }]
+  const warns = []
+  const ctx = llmCtx(() => (async function* () {
+    // 合法 JSON，但模型是在撞上限前刚好收尾
+    yield { type: 'text-delta', text: '{"journal":"### 讨论与解决\\n\\n只有日志","updates":[]}' }
+    yield { type: 'finish', reason: { kind: 'max-tokens' } }
+  })())
+
+  const result = await runReview({
+    ctx, dir, session: { events }, provider: 'p', model: 'm',
+    onWarn: (m) => warns.push(m),
+  })
+
+  assert.equal(result.parseFailed, undefined, '这次确实解析成功了')
+  assert.equal(result.truncated, true, '但仍要标记截断')
+  assert.ok(warns.join('\n').includes('不完整'), '解析成功也要留痕：内容可能不完整')
+  rmSync(dir, { recursive: true, force: true })
+})
+
 test('buildReviewInput：包含对话、今日日志与各文件原文', () => {
   const text = buildReviewInput({
     transcript: '用户：hi',
@@ -318,6 +413,43 @@ test('callText：拼接 text-delta，finish=error 抛错', async () => {
 
   const bad = llmCtx(() => (async function* () { yield { type: 'finish', reason: { kind: 'error' } } })())
   await assert.rejects(() => callText(bad, { provider: 'p', model: 'm', system: 's', prompt: 'u' }), /未正常完成/)
+})
+
+test('callText：onFinish 报出 finish 原因（max-tokens 是可判定的截断信号）', async () => {
+  /*
+   * 为什么需要它：`onWarn` 报出的原文片段自带 500 字符截断，光看日志无法判断
+   * 解析失败是不是「输出撞上限被硬截断」。把 finish.kind 交出来，根因才可判定。
+   *
+   * 官方 FinishReasonMap（@deepseek-ai/dsh-llm/lib/types/types.d.ts）：
+   * stop / tool-calls / max-tokens / aborted / error —— max-tokens 即被截断。
+   */
+  const run = async (kind) => {
+    let seen = null
+    const ctx = llmCtx(() => (async function* () {
+      yield { type: 'text-delta', text: '{"journal":"半截' }
+      yield { type: 'finish', reason: { kind } }
+    })())
+    const text = await callText(ctx, {
+      provider: 'p', model: 'm', system: 's', prompt: 'u',
+      onFinish: (finish) => { seen = finish },
+    })
+    return { seen, text }
+  }
+
+  const stop = await run('stop')
+  assert.equal(stop.seen?.kind, 'stop', 'stop 要照常报出')
+  assert.equal(stop.text, '{"journal":"半截"'.slice(0, -1), '截断的文本照样返回（交给调用方决定）')
+
+  // 关键：max-tokens 不抛错，但必须报出来（此时文本是缺尾的）
+  const cut = await run('max-tokens')
+  assert.equal(cut.seen?.kind, 'max-tokens', 'max-tokens 必须报出（这是可判定的截断信号）')
+  assert.ok(cut.text.startsWith('{"journal"'), '截断的输出仍要返回，不能丢')
+
+  // 没传 onFinish 时不能因为回调缺失而炸
+  const bare = llmCtx(() => (async function* () {
+    yield { type: 'finish', reason: { kind: 'max-tokens' } }
+  })())
+  await assert.doesNotReject(() => callText(bare, { provider: 'p', model: 'm', system: 's', prompt: 'u' }))
 })
 
 test('callText：把超时 signal 传给 provider（挂住时能自己退出）', async () => {

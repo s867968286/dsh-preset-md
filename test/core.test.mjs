@@ -130,49 +130,70 @@ test('sessionKeyOf：兼容 assemble context / agent / 空值', () => {
   assert.equal(sessionKeyOf({}), '')
 })
 
-test('sessionEvents：优先 snapshotEvents，兼容 events 数组与 ownEvents', () => {
-  // 真实 Session 形态：**没有 events 属性**，事件只能通过 snapshotEvents() 读。
-  // 这条用例是「自动日记永远写不出来」那个线上 bug 的回归锁。
-  const real = [{ type: 'user/message' }]
-  assert.deepEqual(sessionEvents({ id: 's1', snapshotEvents: () => real }), real)
+test('sessionEvents：ownEvents 优先于 snapshotEvents（fork 前缀不得被当成本会话事件）', () => {
+  /*
+   * 真事故（2026-09-14 实测）：fork 派生的子代理会话，磁盘上带着父会话的完整历史
+   * （本机 7 个 presetmd 子会话 seedLength 4640～68054，事件流前数百条全是父会话内容）。
+   *
+   * 官方契约（dsh-session/lib/types/index.d.ts）：
+   *   snapshotEvents() → 全量，**含 fork 继承前缀**
+   *   ownEvents()      → 仅 "after its fork-inherited prefix"
+   *
+   * 若优先 snapshotEvents()，`grown` 会在会话第一轮就把整个继承前缀算成「新增」——
+   * 实测这些子会话的转写有 90%～99% 是父会话内容（仅自有 95～113 字符 vs 全量 4363～7889），
+   * 于是每个 fork 子会话第 1 轮必然越线触发，且回顾总结的是"父会话做了什么"。
+   */
+  const inherited = [{ type: 'user/message', data: { content: [{ type: 'text', text: '父会话的内容' }] } }]
+  const own = [{ type: 'user/message', data: { content: [{ type: 'text', text: '子会话自己的内容' }] } }]
+
+  // 两者都有时必须取 ownEvents —— 这正是一条真实 fork Session 的形态
+  const forked = { id: 's1', snapshotEvents: () => inherited, ownEvents: () => own }
+  assert.deepEqual(sessionEvents(forked), own, 'ownEvents 必须优先，否则父会话内容会灌满阈值')
+  assert.notDeepEqual(sessionEvents(forked), inherited)
+
+  // 只有 snapshotEvents 时才用它兜底（非 fork 会话/旧形态）
+  const plain = [{ type: 'user/message', data: { content: [{ type: 'text', text: '普通会话' }] } }]
+  assert.deepEqual(sessionEvents({ id: 's1', snapshotEvents: () => plain }), plain)
 
   // 假 ctx / 旧形态：只有 events 数组
   assert.equal(sessionEvents({ events: [{ type: 'x' }] }).length, 1)
-
-  // 仅 ownEvents() 可用时兜底
-  assert.equal(sessionEvents({ ownEvents: () => [{ type: 'y' }] }).length, 1)
 
   // 什么都没有、或非对象 → 空数组，不抛错
   assert.deepEqual(sessionEvents({}), [])
   assert.deepEqual(sessionEvents(undefined), [])
   assert.deepEqual(sessionEvents(null), [])
 
-  // snapshotEvents 抛错或返回非数组 → 静默回落，不影响调用方
-  const throwing = { snapshotEvents: () => { throw new Error('boom') }, events: [{ type: 'z' }] }
-  assert.equal(sessionEvents(throwing).length, 1)
-  assert.equal(sessionEvents({ snapshotEvents: () => undefined, events: [{ type: 'w' }] }).length, 1)
+  // ownEvents 抛错或返回非数组 → 静默回落到 snapshotEvents
+  assert.deepEqual(
+    sessionEvents({ ownEvents: () => { throw new Error('boom') }, snapshotEvents: () => plain }),
+    plain,
+  )
+  assert.equal(sessionEvents({ ownEvents: () => undefined, snapshotEvents: () => plain }).length, 1)
+  // 两档都不可用 → 落到 events 数组
+  const fallback = { ownEvents: () => { throw new Error('a') }, snapshotEvents: () => { throw new Error('b') }, events: [{ type: 'z' }] }
+  assert.equal(sessionEvents(fallback).length, 1)
 })
 
-test('registerPrompt：complete 实时切换（撤旧建新，不重复注册）', () => {
+test('registerPrompt：section 只注册一次（complete 固定为 true，不再可切换）', () => {
+  /*
+   * `complete` 与 `freeze` 两个开关已移除：我们始终只用一种模式
+   * （独占系统提示词 + 会话内冻结），没有「运行时撤旧建新 section」的需要。
+   * 这条锁住「只注册一次、且始终带 complete」这个简化后的事实 ——
+   * 若有人重新引入切换逻辑，这里会因为 section 被重复注册/丢失 complete 而失败。
+   */
   const dir = makePresetDir({ 'SOUL.md': 'x' })
   const ctx = makeCtx(pathToFileURL(dir).href)
-  let complete = true
-  registerPrompt(ctx, { getSettings: () => ({ complete, freeze: true, budgetNotice: false }) })
+  registerPrompt(ctx, { getSettings: () => ({ budgetNotice: false }) })
   const read = ctx.variables.get(PROMPT_VARIABLE)
 
   assert.equal(ctx.sections.length, 1)
-  assert.equal(ctx.sections[0].complete, true)
+  assert.equal(ctx.sections[0].complete, true, '必须始终独占（否则官方提示词会与我们的 MD 并存）')
+  assert.equal(ctx.sections[0].text, `{{${PROMPT_VARIABLE}}}`, '文本只引用变量')
 
-  // 设置改成 false → 下一次渲染时重建 section
-  complete = false
+  // 多次渲染不应重复注册，也不应丢掉 complete
   read(asSession('s1'))
-  assert.equal(ctx.sections.length, 1, '同名 section 必须撤旧再建，不能累积')
-  assert.equal('complete' in ctx.sections[0], false, '应变成普通 section')
-
-  // 再切回 true
-  complete = true
-  read(asSession('s1'))
-  assert.equal(ctx.sections.length, 1)
+  read(asSession('s2'))
+  assert.equal(ctx.sections.length, 1, 'section 只注册一次，渲染不该增删')
   assert.equal(ctx.sections[0].complete, true)
 
   rmSync(dir, { recursive: true, force: true })
@@ -182,12 +203,13 @@ test('registerPrompt：budgetNotice 实时开关（关掉后不再注入收敛�
   const dir = makePresetDir({ 'MEMORY.md': '一'.repeat(3000) })
   const ctx = makeCtx(pathToFileURL(dir).href)
   let budgetNotice = true
-  registerPrompt(ctx, { getSettings: () => ({ budgetNotice, contextBudget: 1000, freeze: false }) })
+  registerPrompt(ctx, { getSettings: () => ({ budgetNotice, contextBudget: 1000 }) })
   const read = ctx.variables.get(PROMPT_VARIABLE)
 
+  // 注意：正文按会话冻结，所以用不同会话 id 取「当前设置下」的渲染结果
   assert.ok(read(asSession('s1')).includes('上下文预算提醒'))
   budgetNotice = false
-  assert.ok(!read(asSession('s1')).includes('上下文预算提醒'), '关掉后应实时停止注入')
+  assert.ok(!read(asSession('s2')).includes('上下文预算提醒'), '关掉后应实时停止注入')
 
   rmSync(dir, { recursive: true, force: true })
 })
@@ -239,20 +261,11 @@ test('contextFacts / substitutePlaceholders：presetDir 独立于 preset', () =>
 test('registerPrompt：变量承载内容 + 唯一 complete section', () => {
   const dir = makePresetDir({ 'SOUL.md': '人格文本', 'MEMORY.md': '记忆文本' })
   const ctx = makeCtx(pathToFileURL(dir).href)
-  const result = registerPrompt(ctx, { freeze: true, complete: true })
+  const result = registerPrompt(ctx)
 
   assert.equal(result.dir, dir)
-  assert.equal(result.complete, true)
   assert.deepEqual(ctx.sections, [{ name: PROMPT_SECTION, order: 0, text: `{{${PROMPT_VARIABLE}}}`, complete: true }])
   assert.equal(ctx.variables.get(PROMPT_VARIABLE)(asSession('s1')), '人格文本\n\n记忆文本')
-  rmSync(dir, { recursive: true, force: true })
-})
-
-test('registerPrompt：complete=false 时不带 complete 字段', () => {
-  const dir = makePresetDir({ 'SOUL.md': 'x' })
-  const ctx = makeCtx(pathToFileURL(dir).href)
-  registerPrompt(ctx, { complete: false })
-  assert.equal('complete' in ctx.sections[0], false)
   rmSync(dir, { recursive: true, force: true })
 })
 
@@ -336,22 +349,79 @@ async function loadOfficialRenderPrompt() {
   return null
 }
 
-test('registerPrompt：会话内冻结，新会话重读；freeze=false 每次重读', () => {
+test('registerPrompt：会话内冻结（同一会话读盘一次，新会话重读）', () => {
+  /*
+   * 冻结现在是**固定行为**（开关已移除）：同一会话只读一次文件，
+   * 改文件要新开对话才生效 —— 这是为 KV 缓存稳定付出的代价，见 README。
+   */
   const dir = makePresetDir({ 'SOUL.md': '第一版' })
-  const frozenCtx = makeCtx(pathToFileURL(dir).href)
-  registerPrompt(frozenCtx, { freeze: true })
-  const frozen = frozenCtx.variables.get(PROMPT_VARIABLE)
-  assert.equal(frozen(asSession('s1')), '第一版')
+  const ctx = makeCtx(pathToFileURL(dir).href)
+  registerPrompt(ctx)
+  const read = ctx.variables.get(PROMPT_VARIABLE)
+  assert.equal(read(asSession('s1')), '第一版')
   writeFileSync(join(dir, 'SOUL.md'), '第二版', 'utf8')
-  assert.equal(frozen(asSession('s1')), '第一版')
-  assert.equal(frozen(asSession('s2')), '第二版')
+  assert.equal(read(asSession('s1')), '第一版', '同一会话内必须冻结')
+  assert.equal(read(asSession('s2')), '第二版', '新会话要重读')
 
+  // 明确移除的能力：不再有「关掉冻结、每步重读」这条路径
   const liveCtx = makeCtx(pathToFileURL(dir).href)
-  registerPrompt(liveCtx, { freeze: false })
+  registerPrompt(liveCtx, { freeze: false })   // 未知选项应被静默忽略
   const live = liveCtx.variables.get(PROMPT_VARIABLE)
   assert.equal(live(asSession('s1')), '第二版')
   writeFileSync(join(dir, 'SOUL.md'), '第三版', 'utf8')
-  assert.equal(live(asSession('s1')), '第三版')
+  assert.equal(live(asSession('s1')), '第二版', 'freeze 选项已移除，传入也不该每步重读')
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('registerPrompt：缓存命中后不再读盘（每步返回同一份，且不做变化探测）', () => {
+  /*
+   * 这是冻结的**机制**锁：官方每个 pre-step 都会调变量 provider 一次，
+   * 所以我们必须在缓存命中时**一次盘都不读**，才能保证系统提示词逐字节恒定
+   * （它是请求前缀，一变则后面全部丢失 KV 缓存命中）。
+   *
+   * 做法：删除源文件后仍然命中缓存 —— 若实现里还有「探测文件是否变化」
+   * 或「缓存未命中就重读」的逻辑，删文件后必然变成空串或抛错。
+   * 同时也证明我们**不做任何变更探测**，是否重发交给官方判断。
+   */
+  const dir = makePresetDir({ 'SOUL.md': '原始内容' })
+  const ctx = makeCtx(pathToFileURL(dir).href)
+  registerPrompt(ctx)
+  const read = ctx.variables.get(PROMPT_VARIABLE)
+  const session = asSession('s1')
+
+  assert.equal(read(session), '原始内容', '首次读盘')
+
+  // 把整个预设目录删掉：缓存命中就不该再碰文件系统
+  rmSync(dir, { recursive: true, force: true })
+  assert.equal(read(session), '原始内容', '缓存命中后即使文件不存在也应返回同一份（没读盘）')
+
+  // 模拟官方每步调用：多次读取必须完全一致
+  const values = new Set([read(session), read(session), read(session)])
+  assert.equal(values.size, 1, '每步返回值必须逐字节一致')
+
+  // 新会话拿不到文件 → 空串（证明它确实去读盘了，只是旧会话已缓存）
+  assert.equal(read(asSession('s2')), '', '新会话要重新读盘；文件已删则得空串')
+})
+
+test('registerPrompt：注入预算与超限提醒同样按会话冻结（新会话才取新值）', () => {
+  /*
+   * 缓存边界：`cache.get` 包住的是「读 MD + 占位符替换 + 超限提醒」**整段**。
+   * 所以注入预算与超限提醒开关**也**随会话冻结 —— 同一会话内改了要新开会话才生效。
+   *
+   * 这是为「系统提示词在会话内逐字节恒定」付出的代价（它是请求前缀，一变则
+   * 后面全部丢失 KV 缓存命中）。这条锁住这个既成事实，避免有人误以为它们实时。
+   */
+  const dir = makePresetDir({ 'MEMORY.md': '一'.repeat(3000) })
+  const ctx = makeCtx(pathToFileURL(dir).href)
+  let budgetNotice = true
+  registerPrompt(ctx, { getSettings: () => ({ budgetNotice, contextBudget: 1000 }) })
+  const read = ctx.variables.get(PROMPT_VARIABLE)
+  const s1 = asSession('s1')
+
+  assert.ok(read(s1).includes('上下文预算提醒'), '初始应注入提醒')
+  budgetNotice = false
+  assert.ok(read(s1).includes('上下文预算提醒'), '同一会话内仍返回旧渲染（被冻结）')
+  assert.ok(!read(asSession('s2')).includes('上下文预算提醒'), '新会话取到新设置')
   rmSync(dir, { recursive: true, force: true })
 })
 
@@ -468,7 +538,8 @@ test('contextBudgetNotice：总量超限才产出提醒，并点名偏重文件'
 test('registerPrompt：总量超预算时把收敛提醒附在提示词末尾', () => {
   const dir = makePresetDir({ 'MEMORY.md': '一'.repeat(3000) })
   const ctx = makeCtx(pathToFileURL(dir).href)
-  registerPrompt(ctx, { budgetChars: 1000 })
+  // 预算/超限提醒现在只能经 getSettings 提供（静态 options 回退已随开关移除）
+  registerPrompt(ctx, { getSettings: () => ({ contextBudget: 1000, budgetNotice: true }) })
   const text = ctx.variables.get(PROMPT_VARIABLE)(asSession('s1'))
   assert.ok(text.includes('## 上下文预算提醒'))
   rmSync(dir, { recursive: true, force: true })
@@ -477,7 +548,7 @@ test('registerPrompt：总量超预算时把收敛提醒附在提示词末尾', 
 test('registerPrompt：总量没超预算时提示词里没有提醒', () => {
   const dir = makePresetDir({ 'MEMORY.md': '一'.repeat(100) })
   const ctx = makeCtx(pathToFileURL(dir).href)
-  registerPrompt(ctx, { budgetChars: 1000 })
+  registerPrompt(ctx, { getSettings: () => ({ contextBudget: 1000, budgetNotice: true }) })
   const text = ctx.variables.get(PROMPT_VARIABLE)(asSession('s1'))
   assert.ok(!text.includes('上下文预算提醒'))
   rmSync(dir, { recursive: true, force: true })
@@ -486,7 +557,7 @@ test('registerPrompt：总量没超预算时提示词里没有提醒', () => {
 test('registerPrompt：超限提醒可单独关掉（只度量不注入）', () => {
   const dir = makePresetDir({ 'MEMORY.md': '一'.repeat(3000) })
   const ctx = makeCtx(pathToFileURL(dir).href)
-  registerPrompt(ctx, { budgetChars: 1000, budgetNotice: false })
+  registerPrompt(ctx, { getSettings: () => ({ contextBudget: 1000, budgetNotice: false }) })
   const text = ctx.variables.get(PROMPT_VARIABLE)(asSession('s1'))
   assert.ok(!text.includes('上下文预算提醒'), '关掉后不该注入提醒')
   assert.ok(text.includes('一'), '正文照常注入')
