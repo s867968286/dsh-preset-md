@@ -45,7 +45,15 @@ export function renderAllTemplates({ name, userName = '用户' }) {
   return out
 }
 
-/** 渲染 `agent.cordis.yml`。 */
-export function agentCordisTemplate(name) {
-  return readTemplate('agent.cordis.yml').replaceAll('{name}', name)
+/**
+ * 渲染 `agent.cordis.yml`。
+ *
+ * **不接收昵称**：这个文件是**插件行清单**，昵称不写进组合配置——
+ * 它由 `preset.yml` 的 `name` 与 `IDENTITY.md` 承载（前者是官方预设选择器
+ * 读的显示名，后者是模型看到的自我认知）。模板里因此没有任何 `{name}` 占位符，
+ * 早先那个 `name` 参数是彻头彻尾的空操作（`replaceAll('{name}', name)` 永远匹配不到），
+ * 留着只会让人误以为昵称进了 manifest。
+ */
+export function agentCordisTemplate() {
+  return readTemplate('agent.cordis.yml')
 }

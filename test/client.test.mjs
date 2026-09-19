@@ -55,7 +55,7 @@ function load(extraModules = {}) {
 function introspect() {
   const probe = SOURCE.replace(
     "return { apply, inject: ['slots'], name: 'preset-md-client' }",
-    "return { apply, inject: ['slots'], name: 'preset-md-client', __test: { Dialog, CSS, ParamsTab } }",
+    "return { apply, inject: ['slots'], name: 'preset-md-client', __test: { Dialog, CSS, ParamsTab, AgentDetail, TabBar } }",
   )
   assert.notEqual(probe, SOURCE, '未能在 client.js 里定位 return 语句，测试探针需要同步更新')
   let registration = null
@@ -76,10 +76,29 @@ function makeStatefulReact() {
   let cursor = 0
   let component = null
   let props = null
-  const rerender = () => { if (component) render() }
+  let rendering = false
+  /** effect 回调排队：真实 React 在 commit 之后跑，不能在渲染过程中同步跑。 */
+  const pendingEffects = []
+  const rerender = () => {
+    if (!component) return
+    const tree = render()
+    drain()
+    return tree
+  }
+  const drain = () => {
+    while (pendingEffects.length > 0) {
+      const fn = pendingEffects.shift()
+      fn()
+    }
+  }
   const render = () => {
     cursor = 0
-    return component(props)
+    rendering = true
+    try {
+      return component(props)
+    } finally {
+      rendering = false
+    }
   }
   const React = {
     createElement: (type, p, ...children) => ({ type, props: p || {}, children }),
@@ -88,7 +107,12 @@ function makeStatefulReact() {
       if (!(i in slots)) slots[i] = typeof init === 'function' ? init() : init
       const set = (value) => {
         slots[i] = typeof value === 'function' ? value(slots[i]) : value
-        rerender()
+        /*
+         * 渲染过程中调用 setState 只更新槽位、不重入渲染——
+         * 否则 effect 里的 setState 会在首次渲染的栈里递归渲染，
+         * 而那时游标尚未复位，后续 hook 会读到错位的槽。
+         */
+        if (!rendering) rerender()
       }
       return [slots[i], set]
     },
@@ -96,7 +120,8 @@ function makeStatefulReact() {
       const i = cursor++
       if (!(i in slots)) {
         slots[i] = true
-        fn() // 立即执行（本例的 effect 只做一次加载请求）
+        // 排队到本次渲染结束之后执行（模拟 commit 后的 effect）
+        pendingEffects.push(fn)
       }
     },
     useCallback: (fn) => {
@@ -110,9 +135,20 @@ function makeStatefulReact() {
     component = Component
     slots = []
     props = {}
+    pendingEffects.length = 0
+    const tree = render()
+    drain()
+    return tree
+  }
+  /** 重渲染并把排队的 effect 跑完，直到没有任何待处理状态变更。 */
+  const flush = () => {
+    for (let i = 0; i < 50; i += 1) {
+      if (pendingEffects.length === 0) break
+      drain()
+    }
     return render()
   }
-  return { React, mount, rerender: () => render() }
+  return { React, mount, rerender, flush }
 }
 
 /** 在渲染树里深度查找满足条件的节点。 */
@@ -169,15 +205,19 @@ function mountParams({ initial = {}, failPut = false } = {}) {
   }
 }
 
-/** 用指定的 React 桩取内部件。 */
-function introspectWith(ReactImpl) {
+/** 用指定的 React 桩取内部件。`windowStub` 用于注入 / 观测 `window.confirm`。 */
+function introspectWith(ReactImpl, windowStub = {}) {
   const probe = SOURCE.replace(
     "return { apply, inject: ['slots'], name: 'preset-md-client' }",
-    "return { apply, inject: ['slots'], name: 'preset-md-client', __test: { Dialog, CSS, ParamsTab } }",
+    "return { apply, inject: ['slots'], name: 'preset-md-client', __test: { Dialog, CSS, ParamsTab, AgentDetail, TabBar } }",
   )
   assert.notEqual(probe, SOURCE, '未能在 client.js 里定位 return 语句，测试探针需要同步更新')
   let registration = null
-  const window = { __ModuleLoader__: { load: (reg) => { registration = reg } } }
+  /*
+   * client 走 `new Function(..., 'window', ...)`，模块体内引用的是这个**参数**，
+   * 不是 globalThis.window。所以要观测 confirm 就得换掉这里的桩。
+   */
+  const window = { __ModuleLoader__: { load: (reg) => { registration = reg } }, ...windowStub }
   const document = { querySelector: () => null, createElement: () => ({ setAttribute() {}, textContent: '' }), head: { appendChild() {} } }
   new Function('require', 'window', 'document', 'globalThis', probe)((s) => (s === 'react' ? ReactImpl : (() => { throw new Error(s) })()), window, document, globalThis)
   return registration.factory((s) => (s === 'react' ? ReactImpl : (() => { throw new Error(s) })())).__test
@@ -534,3 +574,226 @@ test('参数表单：数字框不显示默认值（清空即用默认，由服�
   }
 })
 
+
+/* ─────────────── AgentDetail：编辑冲突与未保存改动 ───────────────
+ * 这两条对应两个会**静默吃数据**的场景：
+ * 1. 后台自动记忆往 MEMORY.md 追加后，用户拿十年前的快照整文件覆盖 → 那条记忆消失；
+ * 2. 用户改了半天，切页签时草稿被静默换掉。
+ * 前者靠 baseVersion → 409，后者靠 dirty 确认。
+ * ------------------------------------------------------------------ */
+
+/** 为 AgentDetail 接一个模拟 host（含 files / versions / 409 语义）。 */
+function mountDetail({ tab = 'MEMORY.md', initialContent = '原有内容\n', conflict = false, windowStub = {} } = {}) {
+  const files = { 'SYSTEM.md': '', 'SOUL.md': '', 'IDENTITY.md': '', 'USER.md': '', 'AGENTS.md': '', 'MEMORY.md': '' }
+  files[tab] = initialContent
+  const versions = {}
+  for (const key of Object.keys(files)) versions[key] = `v0-${key}`
+  const puts = []
+  const originalFetch = globalThis.fetch
+  /** 置为 true 后所有 /file 写入返回 409（模拟文件已被后台改过）。 */
+  let conflicted = conflict
+
+  globalThis.fetch = async (url, options) => {
+    if (options?.method === 'PUT' && String(url).endsWith('/file')) {
+      const body = JSON.parse(options.body)
+      puts.push(body)
+      if (conflicted) {
+        return {
+          ok: false,
+          status: 409,
+          text: async () => JSON.stringify({ error: `${body.file} 已被后台修改（例如自动记忆写入），请重新载入后再保存` }),
+        }
+      }
+      versions[body.file] = `v1-${body.file}`
+      files[body.file] = body.content
+      return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, version: versions[body.file] }) }
+    }
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({
+        agent: { id: 'demo', name: '小花', description: '温柔', files: { ...files }, versions: { ...versions } },
+      }),
+    }
+  }
+
+  const runtime = makeStatefulReact()
+  const { AgentDetail } = introspectWith(runtime.React, windowStub)
+  /*
+   * 等异步链走完再渲染。
+   *
+   * 桩里的 effect 是同步排队的，而 effect 内部发的是真 fetch（打桩为 async），
+   * `.then` 里的 setState 要等微任务。这里交替「让出微任务」与「渲染」，
+   * 直到渲染树不再停在「加载中」为止。
+   */
+  const flush = async () => {
+    for (let i = 0; i < 10; i += 1) {
+      await new Promise((resolve) => setImmediate(resolve))
+      runtime.flush()
+    }
+  }
+  return {
+    runtime, puts, versions, files, flush,
+    /** 运行时切换冲突模式（载入阶段要放行，保存阶段才模拟 409）。 */
+    setConflict: (value) => { conflicted = value },
+    restore: () => { globalThis.fetch = originalFetch },
+    mount: () => runtime.mount(() => AgentDetail({ id: 'demo', onBack: () => {} })),
+  }
+}
+
+/** 编辑区文本域与保存/取消按钮。 */
+const textarea = (tree) => findAll(tree, (n) => n.type === 'textarea')[0]
+/** 按文案找按钮。默认**精确匹配**——详情页顶部还有一个「保存昵称/签名」，模糊匹配会拿错。 */
+const buttonByText = (tree, label, { exact = true } = {}) => findAll(tree, (n) => {
+  if (n.type !== 'button') return false
+  const text = textOf(n).join('')
+  return exact ? text === label : text.includes(label)
+})[0]
+/** 详情页的页签栏（用 tabs 数组里是否含目标页签来识别）。 */
+const tabBarOf = (tree, key) => findAll(tree, (n) => (
+  n.props && typeof n.props.onChange === 'function'
+  && Array.isArray(n.props.tabs) && n.props.tabs.some((t) => t.key === key)
+))[0]
+
+/**
+ * 挂载详情页并切到指定页签。
+ *
+ * 详情页默认停在第一个页签（SYSTEM.md），所以要断言某个文件的编辑行为，
+ * 必须先切过去——这正是 pickTab 的真实用法。
+ */
+async function mountDetailAt(target) {
+  const detail = mountDetail({ tab: target })
+  detail.mount()
+  await detail.flush()
+  let tree = detail.runtime.rerender()
+  if (target !== 'SYSTEM.md') {
+    const bar = tabBarOf(tree, target)
+    assert.ok(bar, `应能找到页签栏（切到 ${target}）`)
+    bar.props.onChange(target)
+    tree = detail.runtime.rerender()
+  }
+  return { detail, tree }
+}
+
+test('AgentDetail：载入后无改动 → 保存按钮禁用、不显示未保存提示', async () => {
+  const { detail, tree } = await mountDetailAt('MEMORY.md')
+  try {
+    assert.equal(textarea(tree).props.value, '原有内容\n', '应载入文件内容')
+    assert.equal(buttonByText(tree, '保存').props.disabled, true, '无改动时保存应禁用')
+    assert.ok(!treeText(tree).includes('有未保存的改动'))
+  } finally {
+    detail.restore()
+  }
+})
+
+test('AgentDetail：改了草稿 → 提示未保存、保存按钮可用，且能提交', async () => {
+  const { detail, tree: initial } = await mountDetailAt('MEMORY.md')
+  try {
+    let tree = initial
+    textarea(tree).props.onChange({ target: { value: '改后的内容' } })
+    tree = detail.runtime.rerender()
+
+    assert.ok(treeText(tree).includes('有未保存的改动'), '改一下就该提示')
+    assert.equal(buttonByText(tree, '保存').props.disabled, false, '有改动时保存应可用')
+
+    await buttonByText(tree, '保存').props.onClick()
+    await detail.flush()
+    assert.equal(detail.puts.length, 1, '应提交一次')
+    assert.equal(detail.puts[0].content, '改后的内容')
+    assert.equal(detail.puts[0].file, 'MEMORY.md')
+  } finally {
+    detail.restore()
+  }
+})
+
+test('AgentDetail：保存时带上载入时的 baseVersion', async () => {
+  const { detail, tree: initial } = await mountDetailAt('MEMORY.md')
+  try {
+    let tree = initial
+    textarea(tree).props.onChange({ target: { value: '新内容' } })
+    tree = detail.runtime.rerender()
+    await buttonByText(tree, '保存').props.onClick()
+    await detail.flush()
+
+    /*
+     * 不带 baseVersion 就是无条件整文件覆盖：后台自动记忆在此期间追加的内容
+     * 会被静默抹掉。这条锁住「必须带上」。
+     */
+    assert.equal(detail.puts[0].baseVersion, 'v0-MEMORY.md', '必须回传载入时的版本指纹')
+  } finally {
+    detail.restore()
+  }
+})
+
+test('AgentDetail：409 冲突时显示可重载的提示，且不吞掉用户草稿', async () => {
+  const { detail, tree: initial } = await mountDetailAt('MEMORY.md')
+  // 切到这个页签之后再打开冲突模式，避免影响载入
+  detail.setConflict(true)
+  try {
+    let tree = initial
+    textarea(tree).props.onChange({ target: { value: '我的草稿' } })
+    tree = detail.runtime.rerender()
+    await buttonByText(tree, '保存').props.onClick()
+    await detail.flush()
+    tree = detail.runtime.rerender()
+
+    assert.ok(treeText(tree).includes('已被后台修改'), '应把 409 的原因显示出来')
+    assert.ok(buttonByText(tree, '重新载入'), '应给出「重新载入」这条出路')
+    // 草稿不能被吞掉——用户还得能复制走
+    assert.equal(textarea(tree).props.value, '我的草稿', '失败后草稿必须保留')
+  } finally {
+    detail.restore()
+  }
+})
+
+test('AgentDetail：切页签前对未保存改动做确认；取消则留在原页签', async () => {
+  let asked = 0
+  let answer = false
+  const detail = mountDetail({
+    windowStub: {
+      confirm: (text) => { asked += 1; assert.match(text, /未保存/); return answer },
+    },
+  })
+  try {
+    detail.mount()
+    await detail.flush()
+    let tree = detail.runtime.rerender()
+
+    textarea(tree).props.onChange({ target: { value: '未保存的编辑' } })
+    tree = detail.runtime.rerender()
+
+    const tabBar = tabBarOf(tree, 'SOUL.md')
+    assert.ok(tabBar, '应能找到页签栏')
+
+    // 用户点「取消」→ 不该切走，草稿必须还在
+    answer = false
+    tabBar.props.onChange('SOUL.md')
+    tree = detail.runtime.rerender()
+    assert.equal(asked, 1, '应弹确认')
+    assert.equal(textarea(tree).props.value, '未保存的编辑', '取消后草稿不能丢')
+
+    // 用户点「确定」→ 切走并载入新文件
+    answer = true
+    tabBar.props.onChange('SOUL.md')
+    tree = detail.runtime.rerender()
+    assert.equal(asked, 2)
+    assert.equal(textarea(tree).props.value, '', '应载入目标文件内容')
+  } finally {
+    detail.restore()
+  }
+})
+
+test('AgentDetail：无改动时切页签不弹确认（不打扰）', async () => {
+  let asked = 0
+  const detail = mountDetail({ windowStub: { confirm: () => { asked += 1; return true } } })
+  try {
+    detail.mount()
+    await detail.flush()
+    let tree = detail.runtime.rerender()
+
+    tabBarOf(tree, 'SOUL.md').props.onChange('SOUL.md')
+    assert.equal(asked, 0, '没有未保存改动时不该弹确认')
+  } finally {
+    detail.restore()
+  }
+})

@@ -578,6 +578,8 @@ window.__ModuleLoader__.load({
       const [tab, setTab] = React.useState(MD_TABS[0].file)
       const [draft, setDraft] = React.useState('')
       const [message, setMessage] = React.useState('')
+      /** 保存失败时置为冲突提示：让用户知道该重新载入，而不是重试覆盖。 */
+      const [conflict, setConflict] = React.useState(false)
 
       const load = React.useCallback(() => {
         call(`/agents/${id}`).then((data) => {
@@ -585,16 +587,33 @@ window.__ModuleLoader__.load({
           setName(data.agent.name)
           setDescription(data.agent.description || '')
           setDraft(data.agent.files[MD_TABS[0].file] || '')
+          setConflict(false)
         }).catch((error) => setMessage(String(error.message)))
       }, [id])
       React.useEffect(() => { load() }, [load])
 
       if (!agent) return h('div', { className: 'pmd-hint' }, message || '加载中…')
 
+      /**
+       * 当前页签有没有未保存的改动。
+       *
+       * 与「参数」页签的 dirty 判定同一套思路：拿草稿和载入时的基线比。
+       * 这里没有这一步的话，编辑十分钟的内容会在切页签时被静默换掉。
+       */
+      const dirty = draft !== (agent.files[tab] || '')
+
       const pickTab = (file) => {
+        if (file === tab) return
+        /*
+         * 切页签前确认：未保存的编辑不能无声丢弃。
+         * 用 window.confirm（不用自建弹窗）：这是浏览器级的「你要放弃吗」，
+         * 与页面里那些增删改对话框不是一回事，不该共用视觉。
+         */
+        if (dirty && typeof window !== 'undefined' && !window.confirm(`${tab} 有未保存的改动，放弃并切换吗？`)) return
         setTab(file)
         setDraft(agent.files[file] || '')
         setMessage('')
+        setConflict(false)
       }
 
       const saveMeta = async () => {
@@ -609,11 +628,28 @@ window.__ModuleLoader__.load({
 
       const saveFile = async () => {
         try {
-          await call(`/agents/${id}/file`, json('PUT', { file: tab, content: draft }))
-          setAgent({ ...agent, files: { ...agent.files, [tab]: draft } })
+          /*
+           * 带上载入时该文件的版本指纹：后台自动记忆可能在我们编辑期间
+           * 往同一文件追加过内容，服务端比对不一致会回 409。
+           * 不带的话就是无条件整文件覆盖——那条记忆会静默消失。
+           */
+          const data = await call(`/agents/${id}/file`, json('PUT', {
+            file: tab,
+            content: draft,
+            baseVersion: agent.versions ? agent.versions[tab] : undefined,
+          }))
+          setAgent({
+            ...agent,
+            files: { ...agent.files, [tab]: draft },
+            versions: { ...(agent.versions || {}), [tab]: data.version },
+          })
+          setConflict(false)
           setMessage(`${tab} 已保存。若开着「会话内冻结提示词」，需新开对话才生效。`)
         } catch (error) {
-          setMessage(`保存失败：${error.message}`)
+          const text = String(error.message)
+          setMessage(`保存失败：${text}`)
+          // 409 = 文件被后台改过：提示重新载入，而不是让用户反复重试覆盖
+          if (text.includes('已被后台修改')) setConflict(true)
         }
       }
 
@@ -640,15 +676,39 @@ window.__ModuleLoader__.load({
           : h('div', { className: 'pmd-root' },
             h('textarea', { className: 'pmd-textarea', value: draft, onChange: (event) => setDraft(event.target.value) }),
             h('div', { className: 'pmd-row' },
-              h('button', { className: 'pmd-btn pmd-btn-primary', type: 'button', onClick: saveFile }, '保存'),
+              // 有未保存改动时才可点：与「参数」页签同一套门控，避免无谓的接口调用
+              h('button', {
+                className: 'pmd-btn pmd-btn-primary',
+                type: 'button',
+                disabled: !dirty,
+                onClick: saveFile,
+              }, '保存'),
               h('button', {
                 className: 'pmd-text-btn',
                 type: 'button',
+                disabled: !dirty,
                 onClick: () => {
                   setDraft(agent.files[tab] || '')
                   setMessage('')
+                  setConflict(false)
                 },
-              }, '取消'))),
+              }, '取消'),
+              /*
+               * 冲突时给一条**可执行的**出路：重新载入会丢掉本地草稿，
+               * 所以只在用户明确点了才做，且顺带把最新内容拉回来。
+               */
+              conflict
+                ? h('button', {
+                  className: 'pmd-text-btn',
+                  type: 'button',
+                  onClick: () => {
+                    setMessage('')
+                    load()
+                  },
+                }, '重新载入')
+                : null,
+              dirty && !conflict ? h('span', { className: 'pmd-hint' }, '有未保存的改动') : null,
+              message ? h('span', { className: conflict ? 'pmd-err' : 'pmd-hint' }, message) : null)),
       )
     }
 

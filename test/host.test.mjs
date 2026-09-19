@@ -117,16 +117,106 @@ test('preset.yml：值含冒号/引号/反斜杠/换行都能原样往返', () =
   rmSync(home, { recursive: true, force: true })
 })
 
-test('preset.yml：字段始终写全，空值不导致行消失', () => {
+test('preset.yml：有值的字段照常写，order 0 也保留', () => {
   const { home, paths } = makeHome()
   const dir = join(paths.presetsRoot, 'demo')
   mkdirSync(dir, { recursive: true })
   writePresetMeta(dir, { name: 'x', description: '', order: 0 })
   const text = readFileSync(join(dir, 'preset.yml'), 'utf8')
   assert.ok(text.includes('name: x'))
-  assert.ok(text.includes('description: ""'), '空 description 要写成 ""，不能整行消失')
+  /*
+   * 空的 description **不新增该行**（与官方 renderPresetMetadata 的
+   * 「省略而非写空」一致）；但原文里已有该行时仍会更新成 `""`。
+   * 见 writePresetMeta 的注释。
+   */
+  assert.ok(!text.includes('description:'), '原文没有 description 时不该凭空补一行空值')
   assert.ok(text.includes('order: 0'))
   assert.equal(readPresetMeta(dir).order, 0, 'order 0 必须保留，不能回落 undefined')
+  rmSync(home, { recursive: true, force: true })
+})
+
+test('preset.yml：只替换三个已知键，注释与其余字段原样保留', () => {
+  const { home, paths } = makeHome()
+  const dir = join(paths.presetsRoot, 'demo')
+  mkdirSync(dir, { recursive: true })
+  /*
+   * preset.yml 归官方 dsh-agent-presets 管理，用户可以在里面放官方当前不读的键
+   * （id / model / tools）与注释。整文件重写会把这些静默抹掉——这条锁住「不抹」。
+   */
+  writeFileSync(join(dir, 'preset.yml'), [
+    '# 手工注释',
+    'name: 莉莉',
+    'description: 温柔但直接',
+    'order: 3',
+    'id: lili-personal',
+    'model: deepseek-v4',
+    'tools:',
+    '  deny:',
+    '    - bash',
+    '',
+  ].join('\n'), 'utf8')
+
+  writePresetMeta(dir, { name: '莉莉2', description: '温柔但直接', order: 3 })
+  const text = readFileSync(join(dir, 'preset.yml'), 'utf8')
+  assert.ok(text.includes('name: 莉莉2'), '昵称应被替换')
+  assert.ok(text.includes('# 手工注释'), '注释必须保留')
+  assert.ok(text.includes('id: lili-personal'), '未知字段必须保留')
+  assert.ok(text.includes('model: deepseek-v4'), '未知字段必须保留')
+  assert.ok(text.includes('    - bash'), '嵌套结构必须保留')
+  rmSync(home, { recursive: true, force: true })
+})
+
+test('preset.yml：会被 YAML 隐式类型化的值强制加引号', () => {
+  const { home, paths } = makeHome()
+  const dir = join(paths.presetsRoot, 'demo')
+  mkdirSync(dir, { recursive: true })
+  /*
+   * 官方用 js-yaml 读这个文件，未加引号的 123 / true / null / 2026-09-13
+   * 会被读成 number / boolean / null / Date，而官方对非字符串的 name 是
+   * **静默降级成 undefined**（回落显示 id）——不报错，只丢昵称。
+   */
+  for (const value of ['123', 'true', 'null', '~', '2026-09-13', '1.5']) {
+    writePresetMeta(dir, { name: value, description: value, order: 1 })
+    const text = readFileSync(join(dir, 'preset.yml'), 'utf8')
+    assert.ok(
+      text.includes(`name: "${value}"`),
+      `${JSON.stringify(value)} 必须加引号写出，实际：${text.split('\n')[0]}`,
+    )
+    // 本插件的读法本身对称，改引号不影响它
+    assert.equal(readPresetMeta(dir).name, value)
+  }
+  rmSync(home, { recursive: true, force: true })
+})
+
+test('preset.yml：缺 order 的伙伴改名后不该被写成 order: 0', () => {
+  const { home, paths } = makeHome()
+  const dir = join(paths.presetsRoot, 'manual')
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, 'preset.yml'), 'name: 手工\n', 'utf8')
+
+  const current = readPresetMeta(dir)
+  assert.equal(current.order, undefined, '缺 order 应读成 undefined')
+  writePresetMeta(dir, { name: '手工2', description: current.description, order: current.order })
+
+  const text = readFileSync(join(dir, 'preset.yml'), 'utf8')
+  assert.ok(!text.includes('order:'), 'order 为 undefined 时不该补一行（写 0 会排到最前）')
+  assert.equal(readPresetMeta(dir).order, undefined)
+  // 排序哨兵：没有 order 的排最后（与官方 order ?? Infinity 一致）
+  const rows = listAgents(paths)
+  assert.equal(rows[rows.length - 1].id, 'manual', '缺 order 应排在最后')
+  rmSync(home, { recursive: true, force: true })
+})
+
+test('preset.yml：CRLF 文件改写后仍是 CRLF', () => {
+  const { home, paths } = makeHome()
+  const dir = join(paths.presetsRoot, 'crlf')
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, 'preset.yml'), 'name: 甲\r\norder: 1\r\n', 'utf8')
+  writePresetMeta(dir, { name: '乙', order: 1 })
+  const raw = readFileSync(join(dir, 'preset.yml'), 'utf8')
+  assert.ok(raw.includes('\r\n'), '必须保留 CRLF，否则 Windows 上整文件 diff 爆炸')
+  assert.ok(!/[^\r]\n/.test(raw), '不该混入裸 LF')
+  assert.equal(readPresetMeta(dir).name, '乙')
   rmSync(home, { recursive: true, force: true })
 })
 
