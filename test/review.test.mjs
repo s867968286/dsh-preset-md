@@ -11,7 +11,7 @@ import { appendJournal, changelogPath, journalPath } from '../src/memory-store.m
 import { INDEX_CLIP_CHARS, SEARCH_TOOL_NAME, clip, createSearchTool, searchJournal } from '../src/search.mjs'
 import { buildReviewInput, buildTranscript, callText, isHumanMessage, parseReviewJson, REVIEW_SYSTEM_PROMPT, runReview, TRANSCRIPT_TRUNCATED_MARK } from '../src/review.mjs'
 
-const makeDir = () => mkdtempSync(join(tmpdir(), 'preset-md-search-'))
+const makeDir = () => mkdtempSync(join(tmpdir(), 'companion-search-'))
 
 /**
  * 假 ctx：模型服务只能通过 `ctx.get('llm')` 取。
@@ -192,6 +192,56 @@ test('buildTranscript / isHumanMessage：只有 source.kind=user 才算真人发
   assert.equal(isHumanMessage({ type: 'user/message', data: { source: { kind: 'skill-catalog' } } }), false)
   assert.equal(isHumanMessage({ type: 'user/message', data: {} }), false, '缺 source 不能当真人（官方契约里 source 必填）')
   assert.equal(isHumanMessage({ type: 'assistant/message', data: { source: { kind: 'user' } } }), false)
+})
+
+test('回归：本插件写出的 source 必须通过官方 V4 准入（kind:plugin 已被退役）', async () => {
+  /*
+   * 锁的是 dsh 0.1.7-rc.2 的破坏性变更：会话格式 v4 的 `MessageSourceMap` 里
+   * **不再有** `plugin` 兜底 kind，官方注释明写
+   * 「there is no shared catch-all `plugin` kind」。
+   *
+   * 于是新事件带 `{ kind: 'plugin', plugin: 'dsh-companion' }` 会被门禁硬拒：
+   *   `assertV4MessageSources` / `assertV4RowAdmission`（dsh-session-format-v3-to-v4）
+   *   -> `SessionFormatError: format v4 message requires a producer-owned source kind`
+   *
+   * 断言**直接调用官方真包**的准入函数，而不是复刻一份判据——复刻出来的判据
+   * 只能证明「我按自己的理解写对了」，证不了官方接受它（这正是此前 185 条
+   * 全绿、却漏掉这个变更的原因：夹具自己造 source，从不校验插件写出的那条）。
+   */
+  const admission = await import('@deepseek-ai/dsh-session-format-v3-to-v4')
+  const assertV4RowAdmission = admission.assertV4RowAdmission ?? admission.default?.assertV4RowAdmission
+  assert.equal(typeof assertV4RowAdmission, 'function', '官方准入函数必须可用（真包，不是桩）')
+
+  const rowFor = (source) => ({
+    type: 'user/message',
+    seq: 1,
+    data: { id: 'm1', role: 'user', content: [{ type: 'text', text: 'x' }], source },
+  })
+
+  // 先证明这条门禁本身是活的：退役写法必须被拒。
+  // 没有这一步，下面「新写法通过」可能只是因为函数根本没校验。
+  assert.throws(
+    () => assertV4RowAdmission(rowFor({ kind: 'plugin', plugin: 'dsh-companion' }), new Set(['user/message'])),
+    /producer-owned source kind/,
+    '退役的 kind:plugin 必须被官方拒绝（否则这条回归锁是空转的）',
+  )
+
+  // 插件真实写出的那个 source：回顾调用里交给 llm.stream 的 user 消息
+  let sent = null
+  const captureCtx = {
+    get: (name) => (name === 'llm'
+      ? { stream: (options) => { sent = options; return (async function* () {})() } }
+      : undefined),
+  }
+  await callText(captureCtx, { provider: 'p', model: 'm', system: 's', prompt: 'p' })
+
+  const message = sent?.messages?.[0]
+  assert.ok(message, 'callText 必须把消息交给 llm.stream')
+  assert.notEqual(message.source?.kind, 'plugin', '不能再写退役的 kind:plugin')
+  assert.doesNotThrow(
+    () => assertV4RowAdmission({ type: 'user/message', seq: 1, data: message }, new Set(['user/message'])),
+    `插件写出的 source 必须过官方 V4 准入，实际是 ${JSON.stringify(message.source)}`,
+  )
 })
 
 test('runReview：注入消息不计入触发阈值（只算真人与助手）', async () => {

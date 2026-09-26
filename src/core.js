@@ -1,5 +1,5 @@
 /**
- * dsh-preset-md 核心逻辑（零依赖、可单测）。
+ * dsh-companion 核心逻辑（零依赖、可单测）。
  *
  * 职责：把「预设目录」下约定好的 Markdown 文件拼成一段文本，作为**唯一**的
  * systemPrompt section（complete）注入；文本按会话冻结，只在会话第一次渲染时读盘。
@@ -20,15 +20,15 @@ import { homedir } from 'node:os'
 import { isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-/** 插件名（与包名 dsh-preset-md 对应，但 dsh 里用短名）。 */
-export const PLUGIN_NAME = 'preset-md'
+/** 插件名（与包名 dsh-companion 对应，但 dsh 里用短名）。 */
+export const PLUGIN_NAME = 'companion'
 
 /** 承载全部 MD 内容的变量名（内部固定，不做配置项）。 */
-export const PROMPT_VARIABLE = 'preset_md'
+export const COMPANION_PERSONA_VARIABLE = 'companion_persona'
 
 /** 唯一 section 名与 order。 */
-export const PROMPT_SECTION = 'preset-md'
-export const PROMPT_ORDER = 0
+export const COMPANION_PERSONA_SECTION = 'companion'
+export const COMPANION_PERSONA_ORDER = 0
 
 /**
  * 默认文件清单与拼接顺序：
@@ -120,7 +120,7 @@ export function sessionKeyOf(input) {
  *   即只含本会话自己产生的事件
  *
  * 子代理（subagent）会话是通过 fork 派生的，磁盘上**确实带着父会话的完整历史**
- * （实测本机 7 个 presetmd 子会话，`seedLength` 4640～68054，其事件流前数百条
+ * （实测本机若干历史子会话，`seedLength` 4640～68054，其事件流前数百条
  * 全是父会话内容）。用 `snapshotEvents()` 会把这些当成"本会话发生的事"：
  *
  * - **触发阈值被灌满**：`grown` 在会话第一轮就把整个继承前缀算成「新增」，
@@ -372,24 +372,58 @@ export function substitutePlaceholders(text, facts) {
  *
  * 文件清单、目录、截断策略全部硬编码；只有 tools 是配置项。
  *
- * **两个开关已移除**（原本是设置项）：`complete`（独占系统提示词）与
- * `freeze`（会话内冻结）。它们只是「可切换」，而我们始终只用一种模式 ——
- * 独占（本插件的 MD 就是全部系统提示词）+ 冻结（同一会话读盘一次）。
- * 移除后连带砍掉了整块「运行时撤旧建新 section」的机制：那套存在的原因只是
- * `complete` 会变；固定之后 section 只需注册一次。
+ * ## 必须在**会话自己的 scope** 里调用
  *
- * @param {object} ctx - dsh 上下文（需要 systemPrompt）。
- * @param {{variable?: string, sectionName?: string, order?: number, getSettings?: () => object}} [options]
- * @returns {{dir: string, files: Array<object>, cache: object, variable: string, sectionName: string, order: number, getSettings: () => object}}
+ * `complete: true` 表示"系统提示词只保留本段"，也就是**丢弃官方那套提示词**。
+ * 这件事只该在"这个会话绑了伙伴"时发生；没绑就该**完全不注册**，
+ * 让官方提示词原样生效。
+ *
+ * 所以本函数要在 `agent/created` 的监听器里调用 —— 官方契约
+ * （`dsh-agent/lib/types/runtime-types.d.ts:227`）把该监听器的 `this` 标为
+ * `Scoped<Agent>`，即**该 agent 自己的 scope**。而 `systemPrompt.section()` 的
+ * 官方说明是"Register ... **in the calling context's scope**"，`ScopedLayers`
+ * 又保证"the nearest scope's entry wins a name" —— 于是每个会话的注入天然隔离。
+ *
+ * ## 曾经踩过的坑：空文本 ≠ 未注册
+ *
+ * 早先试过"section 恒注册、未绑伙伴时让变量返回空串"，以为空段会自动失效。
+ * **这是错的**，而且比不注册更糟。官方 `dsh-system-prompt/lib/index.js`：
+ *
+ * ```js
+ * const completeSections = sectionDefinitions.filter(s => s.complete === true)
+ * if (completeSections.length > 1) throw ...
+ * if (section.complete === true) completeSection = { ...assembled }   // L345 无条件
+ * ...
+ * sections: completeSection === undefined ? transformed.sections : [completeSection]  // L359
+ * ```
+ *
+ * `completeSection` 只看 `complete === true`，**不看文本是否为空**；而
+ * `[completeSection]` 在渲染过滤（`filter(text.length > 0)`）**之前**就把官方段
+ * 全丢了。结果：空文本的 complete 段 = **把系统提示词清空成 `""`**。
+ *
+ * 所以未绑伙伴时**必须真的不调用本函数**，不能靠空串蒙混。
+ *
+ * @param {object} ctx - **会话 scope** 的上下文（需要 systemPrompt）。
+ * @param {object} [options]
+ * @param {string} [options.dir] - 该会话绑定的伙伴目录；空则注册一个空的
+ *   （调用方应自行判断"没绑就别调"）。
+ * @param {() => object} [options.getSettings] - 实时读设置。
+ * @returns {{files: Function, cache: object, variable: string, sectionName: string, order: number, getSettings: () => object, dir: string}}
  */
 export function registerPrompt(ctx, options = {}) {
-  const dir = resolvePresetDir(ctx)
-  const variable = options.variable ?? PROMPT_VARIABLE
-  const sectionName = options.sectionName ?? PROMPT_SECTION
-  const order = Number.isFinite(options.order) ? options.order : PROMPT_ORDER
+  const variable = options.variable ?? COMPANION_PERSONA_VARIABLE
+  const sectionName = options.sectionName ?? COMPANION_PERSONA_SECTION
+  const order = Number.isFinite(options.order) ? options.order : COMPANION_PERSONA_ORDER
   // 实时读取设置：只有注入预算与超限提醒还留在设置页，它们每次渲染取最新值。
   const getSettings = typeof options.getSettings === 'function' ? options.getSettings : () => ({})
   const cache = createSessionFreeze()
+  /*
+   * 伙伴目录：由调用方（会话绑定时）定下来。
+   *
+   * 兼容老用法：没传 dir 时回落到 `ctx.baseUrl`（preset 行插件的上下文就是
+   * preset 目录），这样"伙伴即预设目录"的老配置仍能工作。
+   */
+  const dir = typeof options.dir === 'string' ? options.dir : resolvePresetDir(ctx)
 
   /**
    * 变量 provider：**每步都会被官方调用**，但我们只让它读一次盘。
@@ -416,7 +450,7 @@ export function registerPrompt(ctx, options = {}) {
    * 那样所有拿不到 id 的会话会共用第一份渲染结果，`{{cwd}}` 之类的替换值会串味。
    * 改为把 cwd 一并编进键：同一会话稳定命中，不同工作目录互不污染。
    */
-  const cacheKeyOf = (context) => {
+  const cacheKeyOf = (context, dir) => {
     const session = sessionKeyOf(context)
     if (session) return session
     const facts = contextFacts(context, dir)
@@ -428,9 +462,15 @@ export function registerPrompt(ctx, options = {}) {
    * 文本只引用变量 —— MD 正文放在变量右值里，官方 interpolate() 不二次扫描，
    * 所以正文里的 `{{…}}` 不会被当真变量解析（见 substitutePlaceholders 的说明）。
    *
-   * 只注册一次：complete 不再可切换，没有「撤旧建新」的需要。
+   * **调用本函数就等于"这个会话要用伙伴"**：未绑伙伴的会话不该走到这里
+   * （见上面的"空文本 ≠ 未注册"）。
+   *
+   * 所以这里再加一道保险：**目录为空时不注册**。调用方漏判时会退化成
+   * "官方提示词原样生效"，而不是把提示词清空 —— 错误的代价小得多。
    */
-  ctx.systemPrompt.section({ name: sectionName, order, text: `{{${variable}}}`, complete: true })
+  if (dir) {
+    ctx.systemPrompt.section({ name: sectionName, order, text: `{{${variable}}}`, complete: true })
+  }
 
   /**
    * 渲染正文。
@@ -449,7 +489,7 @@ export function registerPrompt(ctx, options = {}) {
     const s = getSettings() || {}
     const budgetChars = Number.isFinite(s.contextBudget) && s.contextBudget > 0 ? s.contextBudget : DEFAULT_CONTEXT_BUDGET
     const budgetNotice = s.budgetNotice !== false
-    return cache.get(cacheKeyOf(context), () => {
+    return cache.get(cacheKeyOf(context, dir), () => {
       const body = substitutePlaceholders(readAggregateText(dir), contextFacts(context, dir))
       // 整体超预算时追加一段「请收敛」提示；超限判断发生在替换之后，
       // 因为 {{presetDir}} 之类的替换值也会占体积。
@@ -459,16 +499,15 @@ export function registerPrompt(ctx, options = {}) {
       return notice ? `${body}\n\n${notice}` : body
     })
   }
-  ctx.systemPrompt.variable(variable, read)
-
-  const files = DEFAULT_FILES.map((file) => {
-    const filePath = dir ? join(dir, file) : ''
-    return { file, filePath, exists: filePath ? existsSync(filePath) : false }
-  })
+  // 变量同样只在有目录时注册：否则会留下"引用了不存在变量"的空 section 引用。
+  if (dir) ctx.systemPrompt.variable(variable, read)
 
   return {
     dir,
-    files,
+    files: DEFAULT_FILES.map((file) => {
+      const filePath = dir ? join(dir, file) : ''
+      return { file, filePath, exists: filePath ? existsSync(filePath) : false }
+    }),
     cache,
     variable,
     sectionName,

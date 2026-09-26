@@ -1,7 +1,7 @@
 {
-  "name": "dsh-preset-md",
-  "version": "0.1.0",
-  "description": "给 DSH 助手赋予人格、灵魂与长期记忆：用 Markdown 定义伙伴的身份、性格、准则与记忆，自动写日记、自动更新记忆。Give your DSH assistant a soul, personality, and long-term memory.",
+  "name": "dsh-companion",
+  "version": "1.0.0",
+  "description": "给 DSH 助手赋予人格：伙伴模式（独占人设与记忆、轻量工具）、伙伴设置页与按会话注入。Give your DSH assistant companions with exclusive persona, memory, and a light tool set.",
   "type": "module",
   "main": "src/index.js",
   "exports": {
@@ -35,25 +35,26 @@
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-llm": "0.1.2-rc.1"
+    "@deepseek-ai/dsh-llm": "0.1.7-rc.2"
   },
   "devDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-llm": "0.1.2-rc.1"
+    "@deepseek-ai/cordis": "^4.0.4",
+    "@deepseek-ai/dsh-llm": "0.1.7-rc.2",
+    "@deepseek-ai/dsh-session-format-v3-to-v4": "0.1.7-rc.2"
   },
   "scripts": {
     "test": "node --test",
-    "check": "node --check src/index.js && node --check src/preset.js && node --check src/core.js && node --check src/memory-store.mjs && node --check src/review.mjs && node --check src/settings.mjs && node --check src/templates.mjs && node --check src/tools.mjs && node --check src/search.mjs && node --check client/client.js && node --check scripts/verify-cordis.mjs"
+    "check": "node --check src/index.js && node --check src/preset.js && node --check src/core.js && node --check src/companion.mjs && node --check src/memory-store.mjs && node --check src/review.mjs && node --check src/settings.mjs && node --check src/templates.mjs && node --check src/tools.mjs && node --check src/search.mjs && node --check client/client.js && node --check scripts/verify-cordis.mjs && node --check scripts/migrate-presets.mjs"
   },
   "keywords": [
     "dsh",
     "deepseek-harness",
+    "companion",
     "persona",
     "soul",
     "memory",
-    "companion",
+    "roleplay",
     "ai-assistant",
-    "agent-preset",
     "markdown",
     "system-prompt"
   ]

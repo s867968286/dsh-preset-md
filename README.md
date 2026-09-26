@@ -8,11 +8,30 @@
 
 > **本项目由 AI 生成**：代码与文档均由 AI 编码代理产出并迭代，人类负责需求、设计与实机验证。
 
-DSH 的 agent preset 是一份插件行列表（`<dshHome>/.agent-presets/<id>/agent.cordis.yml`）。
-本插件让一个 preset 从**自己的目录**读取几个约定好的 Markdown 文件，拼成该会话**唯一**的系统提示词；
+**伙伴**是插件自己管理的数据，不依赖官方的 agent preset 机制。
+每个伙伴 = 一个目录，里面是几个约定好的 Markdown 文件；选中的伙伴会拼成该会话**唯一**的系统提示词，
 同时在后台按天写日志、按条目更新记忆文件。
 
+> **为什么要脱离官方 preset**：dsh 0.1.7-rc.2 起预设只能由**已安装的 bundle** 声明
+> （`.agent-presets/<id>/` 目录格式官方已完全不再读取），而"装一个 bundle"意味着
+> **新建伙伴要跑 pnpm 并重启 dsh**。本插件选择保持"即插即用"：新建伙伴只是写几个文件，
+> 刷新页面就能选。代价是伙伴**不会出现在官方的预设选择器里**，选伙伴在对话输入框的工具栏。
+
 提示词按会话冻结：改文件后新开一个对话即可生效，运行中的会话不受影响。
+
+## 怎么用
+
+| 动作 | 在哪 |
+|---|---|
+| **选伙伴** | 对话输入框**工具栏左侧**的下拉（新建对话时可选） |
+| **改伙伴** | 设置 → 伙伴设置 |
+| **不用伙伴** | 下拉里选「无伙伴（用官方提示词）」 |
+
+**三条行为规则**：
+
+1. **开对话前可选**：会话还没开始（`blank`）时，下拉可切换
+2. **开对话后锁定**：首轮发出后绑定不可改，只显示当前伙伴；要换伙伴就新开一个对话
+3. **选「无伙伴」= 官方提示词原样生效**：此时插件**完全不注册任何提示词段**，官方预设（standard 等）完全接管
 
 ## 预览
 
@@ -23,8 +42,7 @@ DSH 的 agent preset 是一份插件行列表（`<dshHome>/.agent-presets/<id>/a
 ## 文件约定
 
 ```
-<dshHome>/.agent-presets/<id>/
-├── agent.cordis.yml     ← 加一行 preset-md
+<dshHome>/preset-md/companions/<id>/
 ├── preset.yml           ← 昵称与个性签名
 ├── SYSTEM.md            ┐
 ├── SOUL.md              │
@@ -35,6 +53,10 @@ DSH 的 agent preset 是一份插件行列表（`<dshHome>/.agent-presets/<id>/a
 ├── memory/              ← 按天日志（YYYY-MM-DD.md）
 └── changelog/           ← 记忆文件的改动留痕
 ```
+
+> 从旧版本升级：伙伴原先在 `<dshHome>/.agent-presets/<id>/`，用
+> `node scripts/migrate-presets.mjs --apply` 搬迁（**只移动、不改内容**）。
+> 迁移前建议先整份备份。
 
 | 文件 | 用途 | 后台回顾可改 |
 |---|---|---|
@@ -87,8 +109,11 @@ dsh plugin --profile <profile> add link:/绝对路径/dsh-preset-md
   name: dsh-preset-md/preset
 ```
 
-目录取 `ctx.baseUrl`——preset 加载器会把它指向 `agent.cordis.yml` 所在目录，
-所以**插件行与那几个 Markdown 必须放在同一个 preset 目录里**。取不到时提示词为空并打一条 warn。
+> **注意（0.1.7-rc.2 起）**：这条路只在"伙伴即 preset 目录"的老用法下有意义。
+> 正常的伙伴选择走**下拉**，伙伴数据在 `<dshHome>/preset-md/companions/`，
+> 与 preset 组合无关。上面这一行是**回落路径**：取不到会话绑定、也没有下拉可用时，
+> 插件才回落到 `ctx.baseUrl`（即 `agent.cordis.yml` 所在目录）读 MD。
+> 两者都取不到时注入为空并打一条 warn。
 
 > **人格类预设只需基础工具。** 内置模板（`templates/agent.cordis.yml.tpl`）给的是
 > 一套精简清单：shell / 文件系统 / 技能 / ask-user / todo / web / present，
@@ -257,7 +282,7 @@ provider/model），而不是全局默认模型——否则会话换过模型后
 | 行为 | 说明 |
 |---|---|
 | 编辑 Markdown | 每个文件一个页签，纯文本编辑（不引 Markdown 渲染库）。无改动时保存按钮禁用；**切换页签前若有未保存改动会先确认** |
-| 新建伙伴 | 用内置模板生成 6 个 Markdown + `agent.cordis.yml` + `preset.yml` + `memory/` |
+| 新建伙伴 | 用内置模板生成 6 个 Markdown + `preset.yml` + `memory/`（**不生成 bundle 声明**——所以无需装包、无需重启） |
 | 复制伙伴 | 克隆内容与组合，不带历史日志 |
 | 删除 | 只移动到备份目录，不真删；新会话选不到，旧对话仍可查看 |
 | 参数 | 存 `<dshHome>/preset-md/settings.json`；改完点「保存」提交。**自动记忆与阈值实时生效**（下一个回合就按新值走，不必重启或重开会话） |
@@ -300,7 +325,16 @@ npm run check     # 语法检查
 ```
 
 运行时依赖只有官方的 `@deepseek-ai/dsh-llm`（用于构造回顾消息与解析模型输出流），
-版本需与 dsh 运行时一致——预发布版本不受 `^` 范围匹配，请写精确版本。
+版本需与 dsh 运行时一致——预发布版本不受 `^` 范围匹配，请写精确版本。当前对齐 **0.1.7-rc.2**。
+
+> **0.1.7-rc.2 的破坏性变更**：会话格式升到 v4 后，`Message.source` 里
+> `plugin` 这个兜底 kind 被**退役**了（官方注释：there is no shared catch-all `plugin` kind）。
+> 新事件若写 `{ kind: 'plugin', plugin: 'dsh-preset-md' }`，官方准入函数
+> `assertV4MessageSources` / `assertV4RowAdmission` 会硬抛
+> `SessionFormatError: format v4 message requires a producer-owned source kind`。
+> 本插件改用**生产者自有 kind** `plugin:dsh-preset-md`（与官方迁移器给未知第三方
+> 生产者的命名一致）。旧会话里已落盘的 `plugin` 只在**读历史**时由迁移器改写，
+> 新写入不受这层照顾，所以必须改调用点。有两条回归测试直接用官方真包的准入函数锁住这一点。
 
 ## 固定行为（不可配）
 
@@ -308,15 +342,36 @@ npm run check     # 语法检查
 
 | 行为 | 说明 |
 |---|---|
-| **独占系统提示词** | 系统提示词只保留本插件的 MD。官方那句身份声明与其他插件注册的提示词段都不再进入请求。同一 scope 里若另有 `complete` 段，组装会直接失败（官方限制：只能有一个） |
+| **独占系统提示词（选了伙伴时）** | 系统提示词只保留该伙伴的 MD。官方那句身份声明与其他插件注册的提示词段都不再进入请求。同一 scope 里若另有 `complete` 段，组装会直接失败（官方限制：只能有一个） |
+| **未选伙伴则不注册任何段** | 选「无伙伴」时插件**一个 section 都不注册**，官方提示词原样生效。⚠️ 注意这**不是**"注册一个空文本的 complete 段"——官方只判 `complete === true` 就把该段当作全部提示词（`dsh-system-prompt/lib/index.js:345,359`），空文本会把提示词**清成 `""`**，比不注册糟糕得多 |
+| **注入按会话隔离** | section 注册在**每个会话自己的 scope** 里（`agent/created` 监听器的 `this`，官方契约标为 `Scoped<Agent>`）。所以一个会话选伙伴不会影响别的会话 |
 | **会话内冻结** | 同一会话只读一次文件，改 Markdown 要新开对话才生效。代价是改动不即时，收益是系统提示词逐字节稳定、KV 缓存前缀持续命中 |
 | **按会话隔离缓存** | 缓存键取会话 id；取不到时用 cwd 兜底，避免不同工作区的 `{{cwd}}` 串味 |
+
+## 设计取舍：为什么伙伴不是"官方预设"
+
+| | 做成官方预设 | 现在的做法 |
+|---|---|---|
+| 新建伙伴 | 生成 bundle → 装进 profile → **重启 dsh** | 写几个文件，**即插即用** |
+| 出现在官方预设选择器 | ✅ | ❌（在对话工具栏选） |
+| 会话级绑定 | 靠官方 `agentPreset` | 写会话事件 `preset-md/companion-selected` |
+| 独占提示词 | ✅ `complete` | ✅ `complete`（同） |
+| 每个伙伴独立人设/记忆 | ✅ | ✅ |
+
+**根因**：rc2 起官方预设只能由**已安装的 bundle** 声明（`agentPresets` 的注册表只接受
+`@deepseek-ai/dsh-agent-preset` 的声明，声明位置是 bundle 的 `presets/<id>.patch.yml`）。
+"新建伙伴 = 装一个包 + 重启" 与"即插即用"在 rc2 下**互斥**，二选一。
+
+本插件选了后者，因为「每个伙伴独立人设 + 完全自定义提示词 + 完全自定义记忆」这三条
+**都不依赖 preset 机制** —— `complete: true` 只是 `systemPrompt.section()` 的一个字段，
+任何已安装插件都能用。被放弃的只有"出现在官方预设选择器里"这一点。
 
 ## 注意事项
 
 | 事项 | 说明 |
 |---|---|
 | 改插件代码要重启 dsh | 已挂载的组合不会热替换模块 |
+| **伙伴增删不用重启** | 伙伴是插件自己的数据；新建/删除后刷新页面即可在下拉里看到 |
 | 官方 `context` 不受影响 | 独占只替换 **section**；沙箱策略、审批策略等运行期快照照常注入 |
 | `preset.yml` 只动三个键 | 昵称/签名写入时只替换 `name` / `description` / `order` 三行，**注释与其余字段原样保留**（官方 `dsh-agent-presets` 也读这个文件）。昵称不写进 `agent.cordis.yml`——那里只是插件行清单 |
 | 设置页写入带冲突检测 | 保存 Markdown 时回传载入时的版本指纹；若后台自动记忆期间改过同一文件，服务端回 **409** 并提示重新载入，不会静默覆盖那条记忆 |

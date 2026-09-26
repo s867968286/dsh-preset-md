@@ -1,36 +1,51 @@
 /**
- * dsh-preset-md —— preset 行插件：把预设目录下的 Markdown 拼成唯一系统提示词，
+ * dsh-companion —— preset 行插件：把预设目录下的 Markdown 拼成唯一系统提示词，
  * 并在后台自动整理日志与记忆。
  *
  * 用法（preset 的 agent.cordis.yml 里加一行）：
  *
- *   - id: preset-md
- *     name: dsh-preset-md/preset      # 主入口是 Host 半，preset 行走子路径
+ *   - id: companion
+ *     name: dsh-companion/preset      # 主入口是 Host 半，preset 行走子路径
  *
- * 行为参数由 `<dshHome>/preset-md/settings.json` 决定，
+ * 行为参数由 `<dshHome>/companion/settings.json` 决定，
  * 可在「设置 → 伙伴设置 → 参数」里改。
  */
-import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 
 import {
   PLUGIN_NAME,
-  PROMPT_ORDER,
-  PROMPT_SECTION,
-  PROMPT_VARIABLE,
   applyToolRestriction,
   measureContext,
   normalizeConfig,
-  registerPrompt,
+  resolvePresetDir,
   sessionEvents,
   sessionKeyOf,
 } from './core.js'
-import { readSettings, resolvePaths } from './settings.mjs'
+import { COMPANION_EVENT, COMPANION_PROJECTION_KEY, companionFromEvents, normalizeCompanion } from './companion.mjs'
+import { readBindings, readSettings, resolvePaths } from './settings.mjs'
 import { createSearchTool } from './search.mjs'
 import { createJournalTool, createMemoryTool } from './tools.mjs'
 import { isHumanMessage, runReview } from './review.mjs'
+
+/**
+ * 注入消息的 `source.kind`：必须是**生产者自有 kind**。
+ *
+ * dsh 0.1.7-rc.2 起会话格式升到 v4，`MessageSourceMap` 里**不再有** `plugin`
+ * 这个兜底 kind（见 dsh-llm 的 `message.d.ts`：「there is no shared catch-all
+ * `plugin` kind」）。新写入门禁会硬拒绝它：
+ *
+ *   `assertV4MessageSources` / `assertV4RowAdmission`（dsh-session-format-v3-to-v4）
+ *   对 `source.kind === 'plugin'` 直接抛
+ *   `SessionFormatError: format v4 message requires a producer-owned source kind`。
+ *
+ * 旧的 `{ kind: 'plugin', plugin: 'dsh-companion' }` 只在**读历史**时由迁移器
+ * 改成自有 kind（未知第三方被判为 `plugin:<包名>`），**新事件**不受这层照顾。
+ * 所以这里直接写迁移器会给我们的那个名字：既不撞门禁，老会话里的写法也能对上。
+ */
+const NOTICE_SOURCE_KIND = 'plugin:dsh-companion'
 
 /** 触发防抖（毫秒），写死。 */
 const REVIEW_DEBOUNCE_MS = 5000
@@ -70,7 +85,7 @@ export function localTimestamp(now = new Date()) {
 }
 
 /**
- * 包一层 logger：既走 dsh 原生日志，也**落盘**到 `<dshHome>/preset-md/preset-md.log`。
+ * 包一层 logger：既走 dsh 原生日志，也**落盘**到 `<dshHome>/companion/companion.log`。
  *
  * 落盘的理由很实际：dsh 以无控制台的方式启动时 stdout 完全看不到，
  * 而后台回顾的成败只打日志——出问题时用户根本无从得知（这正是此前
@@ -78,7 +93,7 @@ export function localTimestamp(now = new Date()) {
  */
 function createLogger(ctx, paths) {
   const base = ctx.logger ?? console
-  const file = join(paths.dshHome, 'preset-md', 'preset-md.log')
+  const file = join(paths.dshHome, 'companion', 'companion.log')
   const write = (level, message) => {
     try {
       mkdirSync(dirname(file), { recursive: true })
@@ -90,9 +105,9 @@ function createLogger(ctx, paths) {
       } catch {
         /* 文件还不存在 */
       }
-      // 落盘时剥掉 `[preset-md]` 前缀：整个文件都属于本插件，前缀纯属噪音。
+      // 落盘时剥掉 `[companion]` 前缀：整个文件都属于本插件，前缀纯属噪音。
       // stdout 那边保留前缀，因为 dsh 的日志里混着别的插件。
-      const line = String(message).replace(/^\[preset-md\]\s*/, '')
+      const line = String(message).replace(/^\[companion\]\s*/, '')
       appendFileSync(file, `${localTimestamp()} [${level}] ${line}\n`, 'utf8')
     } catch {
       /* 落盘失败不影响功能 */
@@ -161,6 +176,74 @@ function transcriptCharsOf(agent) {
 }
 
 /**
+ * 取「这个会话绑定的伙伴目录」。
+ *
+ * @returns {string|undefined}
+ * - 非空字符串：该会话绑定到这个伙伴目录
+ * - `''`：该会话**明确不用伙伴**（用户选了「无」）——此时不注入任何提示词
+ * - `undefined`：**无法判定**（拿不到会话，或会话流里根本没有绑定事件）
+ *   —— 交给调用方回落，不当成"用户不要伙伴"
+ *
+ * ## 为什么要把 '' 与 undefined 分开
+ *
+ * 混起来会出两种相反的错：
+ * - 把 `''` 当 `undefined`：用户选了「无伙伴」，却被回落逻辑注入了旧目录的
+ *   提示词 —— "退路"失效，官方提示词仍被顶掉。
+ * - 把 `undefined` 当 `''`：还没拿到会话时静默变成"什么都不注入"，
+ *   表现为"插件装了但没反应"，且没有任何报错。
+ *
+ * ## 读法：先查 projection，再兜底折叠事件流
+ *
+ * projection 是官方推荐读法（框架维护水位与缓存）；但会话刚建立、
+ * projection 还没被驱动时它可能给不出值，所以再用事件流折叠兜底。
+ * 事件流里**从未出现过**绑定事件时返回 `undefined`（而不是 `''`），
+ * 这样"老式 preset 行插件"用法（伙伴即预设目录）仍能靠回落正常工作。
+ */
+function companionBindingOf(context, paths) {
+  const session = context?.agent?.session ?? context?.session
+  if (!session) return undefined
+
+  /*
+   * 首选：插件自己的绑定表（按 sessionId 索引）。
+   *
+   * 绑定早已不写进会话事件流 —— 官方 v4 门禁会拒绝解读带未知事件类型的
+   * 日志（见 companion.mjs 顶部说明），那会让会话直接打不开。
+   */
+  const fromTable = readBindings(paths)[session.id]
+  if (fromTable !== undefined) return fromTable
+
+  try {
+    // projection 读法：会话上下文里由官方注入当前值
+    const projected = typeof context?.projections?.get === 'function'
+      ? context.projections.get(COMPANION_PROJECTION_KEY)
+      : undefined
+    if (projected !== undefined) return projected
+  } catch {
+    /* 落到事件流兜底 */
+  }
+
+  try {
+    const events = sessionEvents(session)
+    // 区分"没绑（null）"与"压根没有绑定事件"：后者返回 undefined 让调用方回落。
+    return events.some((event) => event?.type === COMPANION_EVENT)
+      ? companionFromEvents(events)
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** 把绑定值解析成伙伴目录（'' = 明确不用伙伴，undefined = 无法判定）。 */
+function companionDirOf(context, paths) {
+  const binding = companionBindingOf(context, paths)
+  if (binding === undefined) return undefined
+  const id = normalizeCompanion(binding)
+  if (!id) return ''
+  const dir = join(paths.companionsRoot, id)
+  return existsSync(dir) ? dir : ''
+}
+
+/**
  * 装配：提示词 → 工具收窄 → 检索工具 → 自动记忆。
  * @param {object} ctx - dsh 上下文。
  * @param {unknown} rawConfig - preset 行的 config（目前只认 tools）。
@@ -178,13 +261,37 @@ export function apply(ctx, rawConfig) {
    */
   const getSettings = () => readSettings(paths)
 
-  /* 提示词：变量承载内容 + 唯一 complete section + 会话内冻结（固定行为，不可配） */
-  const prompt = registerPrompt(ctx, {
-    variable: PROMPT_VARIABLE,
-    sectionName: PROMPT_SECTION,
-    order: PROMPT_ORDER,
-    getSettings,
-  })
+  /*
+   * 工具与自动记忆作用在「这个会话绑定的那个伙伴」上。
+   *
+   * 解析顺序：
+   * ① 会话里绑定了伙伴 → 用它的目录（`companion/companions/<id>/`）
+   * ② 明确选了「无伙伴」→ 空串：不读任何伙伴的数据
+   * ③ 判定不出来 → 回落 `ctx.baseUrl`，兼容"伙伴即 preset 目录"的老用法
+   *
+   * 注意 ③ 用的是**插件自己的 ctx**（`ctx.baseUrl`），不是传入的 `context`：
+   * 自动记忆传进来的是 agent 对象，它**没有 baseUrl**。早先误用传入值，
+   * 会让回落恒为空，表现为"自动记忆全部静默跳过"。
+   */
+  const pluginDir = resolvePresetDir(ctx)
+  const resolveCompanionDir = (context) => {
+    const bound = companionDirOf(context, paths)
+    if (bound !== undefined) return bound
+    return pluginDir
+  }
+
+  /*
+   * **提示词注入不在这里**。
+   *
+   * 它由 host 半（src/index.js）在**每个会话自己的 scope** 里按绑定注册
+   * （见 companion.mjs 的 injectCompanionPrompt）—— 因为"用不用伙伴"是
+   * 每会话各自的决定，而本文件是 preset 行插件：它的 scope 由 preset 决定，
+   * 同一 preset 下的多个会话会共享，表达不了 per-session 差异。
+   *
+   * 早先这里注册过一个恒 `complete: true` 的 section，靠"未绑伙伴时变量返回
+   * 空串"当退路 —— **那是错的**：空文本的 complete 段会把系统提示词清成 ""
+   * （官方 `dsh-system-prompt/lib/index.js:345` 只看 `complete === true`）。
+   */
 
   /* 工具收窄：把模式展开成精确名单后交给 tools.restrict */
   if (config.tools.allow.length > 0 || config.tools.deny.length > 0) {
@@ -193,7 +300,7 @@ export function apply(ctx, rawConfig) {
       const bits = []
       if (result.filter?.allow?.length) bits.push(`allow=${result.filter.allow.join(',')}`)
       if (result.filter?.deny?.length) bits.push(`deny=${result.filter.deny.join(',')}`)
-      logger.info?.(`[preset-md] 工具收窄已生效：${bits.join(' ')}`)
+      logger.info?.(`[companion] 工具收窄已生效：${bits.join(' ')}`)
     } else if (result.reason) {
       /*
        * 把真实异常一并打出来：早先只写一句固定文案，升级到 dsh 0.1.5-rc.2 后这条 warn
@@ -201,40 +308,47 @@ export function apply(ctx, rawConfig) {
        * 边界）就是这样逼出来的，之后不要再把异常吞成散文。
        */
       const detail = result.error ? ` | 错误=${result.error}` : ''
-      logger.warn?.(`[preset-md] 工具收窄未生效：${result.reason}${detail}`)
+      logger.warn?.(`[companion] 工具收窄未生效：${result.reason}${detail}`)
     }
     if (result.unmatched?.length) {
-      logger.warn?.(`[preset-md] 以下工具模式未匹配到任何可见工具：${result.unmatched.join(', ')}`)
+      logger.warn?.(`[companion] 以下工具模式未匹配到任何可见工具：${result.unmatched.join(', ')}`)
     }
   }
 
-  if (!prompt.dir) {
-    logger.warn?.(
-      '[preset-md] 无法确定预设目录（ctx.baseUrl 为空），提示词与自动记忆都不会生效；' +
-        '请确认插件行与 MD 文件在同一个 preset 目录里',
-    )
-    return
-  }
   /*
    * 装配信息合并成一条：早先每样打一行（目录 / 参数 / section / 六个文件各一行），
    * 每次重启就刷 10 行噪音，真正要看的「回顾成败」反而被埋掉。
-   * 现在只留一行，缺文件单独点名（全都在就只列名字）。
+   *
+   * 这里**不打印提示词 section**：它已不在这里注册（见上），而是由 host 半
+   * 按会话绑定注册。插件启动时还没有任何会话，打出来只会误导。
    */
   const startup = getSettings()
-  const present = prompt.files.filter((item) => item.exists).map((item) => item.file.replace(/\.md$/, ''))
-  const missing = prompt.files.filter((item) => !item.exists).map((item) => item.file)
+  const legacyDir = resolvePresetDir(ctx)
   logger.info?.(
-    `[preset-md] 装配 目录=${prompt.dir} | 参数 autoMemory=${startup.autoMemory} ` +
+    `[companion] 装配 伙伴目录=${paths.companionsRoot} | 参数 autoMemory=${startup.autoMemory} ` +
       `reviewTurns=${startup.reviewTurns} reviewChars=${startup.reviewChars} | ` +
-      `section=${prompt.sectionName}(order ${prompt.order}, 变量 {{${prompt.variable}}}) | ` +
-      `文件=${present.join('/') || '（无）'}${missing.length > 0 ? ` 缺:${missing.join(',')}` : ''}`,
+      '提示词按会话绑定注入（未选伙伴则完全不加，官方提示词原样生效）',
   )
+  if (legacyDir) {
+    logger.info?.(`[companion] 回落目录（会话未绑伙伴且无绑定时才使用）=${legacyDir}`)
+  }
 
-  /* 注入体积：整体预算与各文件占比，一次量清 */
-  logContextUsage(prompt.dir, getSettings(), logger)
+  /* 注入体积：整体预算与各文件占比，一次量清（伙伴未绑定时跳过） */
+  const startupDir = resolveCompanionDir(null)
+  if (startupDir) logContextUsage(startupDir, getSettings(), logger)
 
-  /* 记忆工具：读（检索历史日志）+ 写（日志 / 长期记忆） */
+  /*
+   * 记忆工具：读（检索历史日志）+ 写（日志 / 长期记忆）。
+   *
+   * 工具是**按 agent 注册**的，但伙伴的目录要等会话绑定时才知道，
+   * 所以工厂接收一个「取目录」函数而不是固定路径 —— 每次调用时现取，
+   * 这样"先建会话、后选伙伴"也能命中正确的目录。
+   */
   if (typeof ctx.tools?.register === 'function') {
+    const dirFor = () => {
+      const dir = resolveCompanionDir(null)
+      return dir || legacyDir
+    }
     const toolFactories = [
       [createSearchTool, 'preset_md_search'],
       [createJournalTool, 'preset_md_journal'],
@@ -242,11 +356,11 @@ export function apply(ctx, rawConfig) {
     ]
     for (const [factory, toolName] of toolFactories) {
       try {
-        ctx.tools.register(factory(prompt.dir))
+        ctx.tools.register(factory(dirFor()))
       } catch (error) {
         // 成功不打日志：三个工具每次都一样，写进去只是噪音；失败才值得说。
         logger.warn?.(
-          `[preset-md] ${toolName} 注册失败（不影响其余功能）：${error instanceof Error ? error.message : String(error)}`,
+          `[companion] ${toolName} 注册失败（不影响其余功能）：${error instanceof Error ? error.message : String(error)}`,
         )
       }
     }
@@ -254,7 +368,7 @@ export function apply(ctx, rawConfig) {
 
   // 始终挂上自动记忆：开关改为在每次触发时实时判断，
   // 这样「关掉自动记忆」对运行中的会话也立即生效（不必等新会话）。
-  registerAutoMemory(ctx, prompt, getSettings, logger)
+  registerAutoMemory(ctx, resolveCompanionDir, getSettings, logger)
 }
 /**
  * 量一遍注入体积并打日志。
@@ -270,12 +384,12 @@ function logContextUsage(dir, settings, logger) {
     .map((row) => `${row.file.replace(/\.md$/, '')} ${row.chars}(${Math.round(row.share * 100)}%)`)
     .join(' ')
   logger.info?.(
-    `[preset-md] 注入体积 ${measure.totalChars} 字符 ≈ ${measure.totalTokens} token，` +
+    `[companion] 注入体积 ${measure.totalChars} 字符 ≈ ${measure.totalTokens} token，` +
       `预算 ${measure.budgetChars}（占 ${percent}%）| ${detail}`,
   )
   if (measure.over) {
     logger.warn?.(
-      `[preset-md] 注入体积已超出预算（${measure.totalChars}/${measure.budgetChars}，占 ${percent}%）。` +
+      `[companion] 注入体积已超出预算（${measure.totalChars}/${measure.budgetChars}，占 ${percent}%）。` +
         `偏重：${measure.heaviest.map((row) => row.file).join('、') || '（无单文件明显偏重）'}。` +
         '已把「请收敛」提醒注入给模型。',
     )
@@ -298,7 +412,7 @@ function shortKey(key) {
  * 触发条件满足却没能写入时，除了打日志，还会**往对话里注入一条提示**——
  * 失败发生在后台，日志又只在 dsh 进程的 stdout，用户默认看不到。
  */
-function registerAutoMemory(ctx, prompt, getSettings, logger) {
+function registerAutoMemory(ctx, resolveCompanionDir, getSettings, logger) {
   /** sessionKey -> { turns, markChars, lastAt, running, runningSince, pending, lastNoticeAt, attempts } */
   const states = new Map()
 
@@ -368,16 +482,16 @@ function registerAutoMemory(ctx, prompt, getSettings, logger) {
     const now = Date.now()
     if (now - state.lastNoticeAt < NOTICE_THROTTLE_MS) return
     state.lastNoticeAt = now
-    const message = `[preset-md] ${text}`
+    const message = `[companion] ${text}`
     try {
       agent?.inject?.(
         createUserMessage({
           content: [{ type: 'text', text: message }],
-          source: { kind: 'plugin', plugin: 'dsh-preset-md' },
+          source: { kind: NOTICE_SOURCE_KIND },
         }),
       )
     } catch (error) {
-      logger.warn?.(`[preset-md] 失败提示未能注入对话：${error instanceof Error ? error.message : String(error)}`)
+      logger.warn?.(`[companion] 失败提示未能注入对话：${error instanceof Error ? error.message : String(error)}`)
     }
   }
 
@@ -399,7 +513,7 @@ function registerAutoMemory(ctx, prompt, getSettings, logger) {
         if (force) state.pending = reason
         return
       }
-      logger.warn?.('[preset-md] 上一次自动记忆疑似卡死，强制解锁后重试')
+      logger.warn?.('[companion] 上一次自动记忆疑似卡死，强制解锁后重试')
       state.running = false
     }
 
@@ -426,29 +540,46 @@ function registerAutoMemory(ctx, prompt, getSettings, logger) {
         const model = resolveModel(agent)
         if (!model) {
           const detail = '拿不到会话模型与默认模型，本次未执行'
-          logger.warn?.(`[preset-md] 自动记忆跳过：${detail}`)
+          logger.warn?.(`[companion] 自动记忆跳过：${detail}`)
           notify(agent, key, `自动记忆已满足触发条件（${reason}），但${detail}。`)
+          return
+        }
+        /*
+         * 回顾写到**这个会话绑定的伙伴**目录里。
+         *
+         * 没绑伙伴就没有可写的地方——此时不回顾，也不要瞎猜一个目录写进去
+         * （那会把 A 伙伴的对话记到 B 伙伴的日记里）。
+         *
+         * 取目录走 `resolveCompanionDir`（apply() 里构造的闭包）。本函数是
+         * 独立的顶层函数，看不到那个局部变量——早先直接引用会抛
+         * `resolveCompanionDir is not defined`，表现为自动记忆全部失败。
+         * 所以它由调用方以参数传进来。
+         */
+        const reviewDir = resolveCompanionDir(agent)
+        if (!reviewDir) {
+          consumed = true
+          logger.info?.(`[companion] 自动记忆跳过（该会话未绑定伙伴，触发=${reason}，会话=${shortKey(key)}）`)
           return
         }
         const result = await runReview({
           ctx,
-          dir: prompt.dir,
+          dir: reviewDir,
           session: agent?.session,
           provider: model.provider,
           model: model.model,
           // 转写窗口跟随触发阈值：阈值调大后回顾间隔变长，窗口必须同步放大
           transcriptChars: settings.reviewChars,
-          onWarn: (message) => logger.warn?.(`[preset-md] ${message}`),
+          onWarn: (message) => logger.warn?.(`[companion] ${message}`),
         })
         if (result.skipped) {
           // 正常跳过（例如对话太短）：这是终态，不算失败，照常推进水位。
           consumed = true
-          logger.info?.(`[preset-md] 自动记忆跳过（${result.skipped}，触发=${reason}，会话=${shortKey(key)}）`)
+          logger.info?.(`[companion] 自动记忆跳过（${result.skipped}，触发=${reason}，会话=${shortKey(key)}）`)
         } else if (result.parseFailed) {
           // 解析失败 = 日记与记忆都没写入，这段内容**没被消费**：不推进水位，下轮重试
           const detail = '模型输出解析失败，本轮日记与记忆都没写入'
           logger.warn?.(
-            `[preset-md] 自动记忆已触发（${reason}，会话=${shortKey(key)}）但${detail}。原文片段：${result.parseFailed}`,
+            `[companion] 自动记忆已触发（${reason}，会话=${shortKey(key)}）但${detail}。原文片段：${result.parseFailed}`,
           )
           notify(agent, key, `自动记忆已满足触发条件（${reason}），但${detail}。`)
         } else {
@@ -461,28 +592,28 @@ function registerAutoMemory(ctx, prompt, getSettings, logger) {
            */
           if (result.truncated) {
             logger.warn?.(
-              `[preset-md] 自动记忆输出被截断（finish=max-tokens，触发=${reason}，会话=${shortKey(key)}）：` +
+              `[companion] 自动记忆输出被截断（finish=max-tokens，触发=${reason}，会话=${shortKey(key)}）：` +
                 `已写入 [${applied || '无'}]，但内容可能不完整（updates 可能被截掉）；` +
                 `考虑在下一条记忆里精简表达`,
             )
           }
           if (applied) {
-            logger.info?.(`[preset-md] 自动记忆完成（触发=${reason}，会话=${shortKey(key)}）：${applied}`)
+            logger.info?.(`[companion] 自动记忆完成（触发=${reason}，会话=${shortKey(key)}）：${applied}`)
           } else if (result.journalEmpty) {
             // 不一律告警：按规则，寒暄/简单问答/测试本来就该留空，那是正常结果。
             // 这里记 info 并带上转写长度，长度能帮人判断这个「空」是否合理。
             const length = Number.isFinite(result.transcriptLength) ? result.transcriptLength : -1
             logger.info?.(
-              `[preset-md] 自动记忆完成（触发=${reason}，会话=${shortKey(key)}）：本轮未追加日志——` +
+              `[companion] 自动记忆完成（触发=${reason}，会话=${shortKey(key)}）：本轮未追加日志——` +
                 `模型判定没有值得记录的新内容（转写 ${length} 字符；若本轮确实只是寒暄 / 简单问答 / 测试则属正常）`,
             )
           } else {
-            logger.info?.(`[preset-md] 自动记忆完成（触发=${reason}，会话=${shortKey(key)}）：记忆无改动`)
+            logger.info?.(`[companion] 自动记忆完成（触发=${reason}，会话=${shortKey(key)}）：记忆无改动`)
           }
         }
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error)
-        logger.warn?.(`[preset-md] 自动记忆失败：${detail}`)
+        logger.warn?.(`[companion] 自动记忆失败：${detail}`)
         notify(agent, key, `自动记忆已满足触发条件（${reason}），但执行失败：${detail}`)
       } finally {
         /*
@@ -503,7 +634,7 @@ function registerAutoMemory(ctx, prompt, getSettings, logger) {
         state.attempts = attempts
         if (giveUp) {
           logger.warn?.(
-            `[preset-md] 自动记忆连续 ${attempts} 次失败，放弃这一段（触发=${reason}，会话=${shortKey(key)}），` +
+            `[companion] 自动记忆连续 ${attempts} 次失败，放弃这一段（触发=${reason}，会话=${shortKey(key)}），` +
               `避免水位永久卡死；后续内容仍会正常回顾`,
           )
         }
@@ -537,8 +668,7 @@ function registerAutoMemory(ctx, prompt, getSettings, logger) {
     if (!key) return
     // 会话结束必触发：force 绕过防抖。开关关闭时同样不写。
     if (getSettings().autoMemory === true) schedule(agent, key, '会话结束', true)
-    // 提示词缓存按会话键存放，会话结束一并清掉，避免 Map 增长
-    prompt.cache.clear(key)
+    // 会话结束：状态表按会话键存放，一并清掉避免 Map 增长
     agentsBySession.delete(key)
     // 留足时间给可能正在跑的回顾（含补跑），之后才清状态
     setTimeout(() => states.delete(key), RUNNING_STALE_MS).unref?.()

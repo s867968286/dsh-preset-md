@@ -48,11 +48,12 @@ export function renderAllTemplates({ name, userName = '用户' }) {
 /**
  * 渲染 `agent.cordis.yml`。
  *
- * **不接收昵称**：这个文件是**插件行清单**，昵称不写进组合配置——
- * 它由 `preset.yml` 的 `name` 与 `IDENTITY.md` 承载（前者是官方预设选择器
- * 读的显示名，后者是模型看到的自我认知）。模板里因此没有任何 `{name}` 占位符，
- * 早先那个 `name` 参数是彻头彻尾的空操作（`replaceAll('{name}', name)` 永远匹配不到），
- * 留着只会让人误以为昵称进了 manifest。
+ * **保留但不再使用**：rc2 起官方不再读 `.agent-presets/<id>/agent.cordis.yml`，
+ * 伙伴也不再需要生成组合清单（提示词独占由 `complete` section 承担）。
+ * 保留这个函数与模板文件，是因为迁移过来的老伙伴目录里可能还有这个文件，
+ * 且它记录了"人格类预设该挂哪些工具行"，作为历史参考仍有价值。
+ *
+ * **不接收昵称**：它是插件行清单，昵称由 `preset.yml` 与 `IDENTITY.md` 承载。
  */
 export function agentCordisTemplate() {
   return readTemplate('agent.cordis.yml')

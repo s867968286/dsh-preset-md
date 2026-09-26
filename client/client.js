@@ -1,20 +1,32 @@
 /**
- * dsh-preset-md 的 Client 半：在官方设置页里注册一个「伙伴设置」页面。
+ * dsh-companion 的 Client 半：在官方设置页里注册一个「伙伴设置」页面。
  *
  * - 只用一个官方 slot：`settings.section`（一个注册 = 一个设置页，导航行由官方渲染）；
  * - 不引任何 UI 组件库：React.createElement + 原生 input/textarea/button；
- * - 数据全部走 Host 半的 `/preset-md/api/*`（同源 fetch）。
+ * - 数据全部走 Host 半的 `/companion/api/*`（同源 fetch）。
  */
 window.__ModuleLoader__.load({
-  id: 'dsh-preset-md',
+  id: 'dsh-companion',
   factory(require) {
     const React = require('react')
     const h = React.createElement
     // 不 require 任何官方 UI 包：`@deepseek-ai/dsh-client-ui-primitives` 在当前 DSH
     // 版本已不存在，顶层解构会抛错，导致 factory 失败 → apply 从不执行 → 整页裸样式。
     // 组件与图标都在下方自建（Dialog / Icon*），只依赖 react。
-    const API = '/preset-md/api'
-    const SECTION_ID = 'preset-md'
+    const API = '/companion/api'
+    const SECTION_ID = 'companion'
+    /*
+     * 伙伴下拉在 `conversation.input.left` 里的格子 id。
+     * 用一个**自有** id（不是官方已有的），这样官方契约保证它被**追加**在内置项
+     * 旁边，而不是替换掉某一格。
+     */
+    const COMPANION_SLOT_ID = 'companion-mode'
+    /*
+     * 「伙伴模式」预设 id —— 与 src/companion-preset.mjs 的 COMPANION_PRESET_ID
+     * 必须保持一致：它是下拉显形的唯一闸门（会话挂了这个预设才显示伙伴下拉）。
+     * client 不直接 require host 侧模块（bundle 边界），所以这里字面量 + 测试锁同步。
+     */
+    const COMPANION_PRESET_ID = 'companion-mode'
 
     const MD_TABS = [
       { file: 'SYSTEM.md', label: '提示词' },
@@ -26,90 +38,104 @@ window.__ModuleLoader__.load({
     ]
 
     const CSS = [
-      '.pmd-root{font-size:13px;color:var(--dsw-alias-label-primary,#1f1f1f);display:flex;flex-direction:column;gap:12px}',
-      '.pmd-tabs{display:flex;align-items:flex-end;gap:22px;margin-top:2px;border-bottom:.5px solid var(--dsw-alias-border-l2,#e5e5e5)}',
-      '.pmd-tab{cursor:pointer;background:none;border:0;padding:7px 1px 9px;font-size:13px;line-height:20px;color:var(--dsw-alias-label-tertiary,#8c8c8c);position:relative}',
-      '.pmd-tab:hover{color:var(--dsw-alias-label-primary,#1f1f1f)}',
-      '.pmd-tab[data-on="1"]{color:var(--dsw-alias-label-primary,#1f1f1f)}',
-      '.pmd-tab[data-on="1"]:after{background:var(--dsw-alias-label-primary,#1f1f1f);content:"";border-radius:2px 2px 0 0;height:2px;position:absolute;bottom:-1px;left:0;right:0}',
-      '.pmd-tab:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4a7dff);outline-offset:2px;color:var(--dsw-alias-label-primary,#1f1f1f);border-radius:2px}',
-      '.pmd-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(268px,1fr));grid-auto-rows:1fr;gap:12px}',
-      '.pmd-card{border:.5px solid var(--dsw-alias-border-l4,#e0e0e0);border-radius:20px;padding:0;display:flex;flex-direction:column;gap:0;background:transparent;overflow:hidden}',
-      '.pmd-card:hover{background:var(--dsw-alias-interactive-bg-hover,#f5f5f5)}',
-      '.pmd-card-main{display:flex;flex-direction:column;flex:1;gap:8px;padding:14px 16px 12px}',
-      '.pmd-card-head{display:flex;align-items:center;gap:8px}',
-      '.pmd-card-name{font-size:15px;font-weight:600;line-height:1.4}',
-      '.pmd-card-desc{color:var(--dsw-alias-label-secondary,#6b6b6b);font-size:13px;line-height:1.55;min-height:42px;white-space:pre-wrap;overflow-wrap:anywhere;overflow:hidden;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical}',
-      '.pmd-card-id{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--dsw-alias-label-tertiary,#8c8c8c);font-size:11px;margin-top:auto}',
-      '.pmd-card-foot{border-top:.5px solid var(--dsw-alias-border-l2,#e5e5e5);display:flex;justify-content:flex-end;gap:2px;padding:6px 10px}',
-      '.pmd-icon-btn{appearance:none;display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border:0;border-radius:7px;color:var(--dsw-alias-label-tertiary,#8c8c8c);background:transparent;cursor:pointer;position:relative}',
-      '.pmd-icon-btn:hover:not(:disabled){background:var(--dsw-alias-bg-layer-1,#f2f2f2);color:var(--dsw-alias-label-primary,#1f1f1f)}',
-      '.pmd-icon-btn:disabled{opacity:.4;cursor:default}',
-      '.pmd-icon-btn-danger:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover-danger,#fdecea);color:var(--dsw-alias-state-error-primary,#c0392b)}',
-      '.pmd-icon-btn:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-1px}',
-      '.pmd-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}',
-      '.pmd-btn{appearance:none;box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;gap:4px;height:32px;border:1px solid var(--dsw-alias-border-l2,#d9d9d9);border-radius:16px;padding:0 14px;color:var(--dsw-alias-label-primary,#1f1f1f);background:transparent;cursor:pointer;font:inherit;font-size:13px;line-height:20px;white-space:nowrap}',
-      '.pmd-btn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,#f2f2f2)}',
-      '.pmd-btn-primary{border-color:transparent;color:var(--dsw-alias-label-primary-foreground,#fff);background:var(--dsw-alias-button-primary-fill,#1f1f1f)}',
-      '.pmd-btn-primary:hover:not(:disabled){background:var(--dsw-alias-button-primary-hover,#333)}',
-      '.pmd-text-btn{appearance:none;display:inline-flex;align-items:center;justify-content:center;height:28px;border:0;border-radius:14px;padding:0 10px;color:var(--dsw-alias-label-secondary,#6b6b6b);background:transparent;cursor:pointer;font:inherit;font-size:12.5px;line-height:18px}',
-      '.pmd-text-btn:hover:not(:disabled){color:var(--dsw-alias-label-primary,#1f1f1f);background:var(--dsw-alias-interactive-bg-hover,#f2f2f2)}',
-      '.pmd-input{width:100%;box-sizing:border-box;border:.5px solid var(--dsw-alias-border-l4,#d9d9d9);padding:9px 12px;border-radius:10px;background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-primary,#1f1f1f);font:inherit;font-size:13px}',
-      '.pmd-input:focus{outline:none;border-color:var(--dsw-alias-brand-primary,#4a7dff)}',
-      '.pmd-input::placeholder{color:var(--dsw-alias-label-dimmed,#9a9a9a)}',
-      '.pmd-textarea{width:100%;box-sizing:border-box;min-height:360px;border:.5px solid var(--dsw-alias-border-l4,#d9d9d9);padding:10px 12px;border-radius:10px;background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-primary,#1f1f1f);font-family:ui-monospace,Consolas,monospace;font-size:12.5px;line-height:1.6;resize:vertical}',
-      '.pmd-textarea:focus{outline:none;border-color:var(--dsw-alias-brand-primary,#4a7dff)}',
-      '.pmd-hint{color:var(--dsw-alias-label-tertiary,#6b6b6b)}',
-      '.pmd-err{color:var(--dsw-alias-state-error-primary,#c0392b)}',
-      '.pmd-ok{color:var(--dsw-alias-state-success-primary,#2f9e44)}',
-      '.pmd-field{display:flex;flex-direction:column;gap:6px}',
-      '.pmd-field-label{color:var(--dsw-alias-label-secondary,#6b6b6b);font-size:12px;font-weight:500}',
-      '.pmd-set-row{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;min-width:0;min-height:52px;padding:8px 0;border-top:1px solid var(--dsw-alias-border-l2,#e5e5e5);color:var(--dsw-alias-label-primary,#1f1f1f);font-size:13px;line-height:1.5}',
-      '.pmd-set-label{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}',
-      '.pmd-set-label b{font-size:14px;font-weight:500;color:var(--dsw-alias-label-primary,#1f1f1f);line-height:21px}',
-      '.pmd-set-label span{font-size:11px;color:var(--dsw-alias-label-tertiary,#8c8c8c);line-height:17px}',
-      '.pmd-perm{display:flex;flex-direction:column}',
-      '.pmd-perm>.pmd-set-row{padding:10px 0 8px}',
-      '.pmd-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;padding:0 0 14px;max-width:420px}',
-      '.pmd-fields label{display:flex;flex-direction:column;gap:5px;color:var(--dsw-alias-label-secondary,#6b6b6b);font-size:12px;line-height:16px;font-weight:500}',
-      '.pmd-fields input{width:100%;box-sizing:border-box;height:34px;border:.5px solid var(--dsw-alias-border-l4,#d9d9d9);border-radius:9px;padding:0 10px;background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-primary,#1f1f1f);font:inherit;font-size:13px}',
-      '.pmd-fields input:focus{outline:none;border-color:var(--dsw-alias-brand-primary,#4a7dff)}',
-      '.pmd-fields input:disabled{opacity:.45;cursor:default}',
-      '.pmd-fields-single{grid-template-columns:minmax(0,1fr);max-width:260px;padding-bottom:6px}',
+      '.cmd-root{font-size:13px;color:var(--dsw-alias-label-primary,#1f1f1f);display:flex;flex-direction:column;gap:12px}',
+      '.cmd-tabs{display:flex;align-items:flex-end;gap:22px;margin-top:2px;border-bottom:.5px solid var(--dsw-alias-border-l2,#e5e5e5)}',
+      '.cmd-tab{cursor:pointer;background:none;border:0;padding:7px 1px 9px;font-size:13px;line-height:20px;color:var(--dsw-alias-label-tertiary,#8c8c8c);position:relative}',
+      '.cmd-tab:hover{color:var(--dsw-alias-label-primary,#1f1f1f)}',
+      '.cmd-tab[data-on="1"]{color:var(--dsw-alias-label-primary,#1f1f1f)}',
+      '.cmd-tab[data-on="1"]:after{background:var(--dsw-alias-label-primary,#1f1f1f);content:"";border-radius:2px 2px 0 0;height:2px;position:absolute;bottom:-1px;left:0;right:0}',
+      '.cmd-tab:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4a7dff);outline-offset:2px;color:var(--dsw-alias-label-primary,#1f1f1f);border-radius:2px}',
+      '.cmd-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(268px,1fr));grid-auto-rows:1fr;gap:12px}',
+      '.cmd-card{border:.5px solid var(--dsw-alias-border-l4,#e0e0e0);border-radius:20px;padding:0;display:flex;flex-direction:column;gap:0;background:transparent;overflow:hidden}',
+      '.cmd-card:hover{background:var(--dsw-alias-interactive-bg-hover,#f5f5f5)}',
+      '.cmd-card-main{display:flex;flex-direction:column;flex:1;gap:8px;padding:14px 16px 12px}',
+      '.cmd-card-head{display:flex;align-items:center;gap:8px}',
+      '.cmd-card-name{font-size:15px;font-weight:600;line-height:1.4}',
+      '.cmd-card-desc{color:var(--dsw-alias-label-secondary,#6b6b6b);font-size:13px;line-height:1.55;min-height:42px;white-space:pre-wrap;overflow-wrap:anywhere;overflow:hidden;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical}',
+      '.cmd-card-id{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--dsw-alias-label-tertiary,#8c8c8c);font-size:11px;margin-top:auto}',
+      '.cmd-card-foot{border-top:.5px solid var(--dsw-alias-border-l2,#e5e5e5);display:flex;justify-content:flex-end;gap:2px;padding:6px 10px}',
+      '.cmd-icon-btn{appearance:none;display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border:0;border-radius:7px;color:var(--dsw-alias-label-tertiary,#8c8c8c);background:transparent;cursor:pointer;position:relative}',
+      '.cmd-icon-btn:hover:not(:disabled){background:var(--dsw-alias-bg-layer-1,#f2f2f2);color:var(--dsw-alias-label-primary,#1f1f1f)}',
+      '.cmd-icon-btn:disabled{opacity:.4;cursor:default}',
+      '.cmd-icon-btn-danger:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover-danger,#fdecea);color:var(--dsw-alias-state-error-primary,#c0392b)}',
+      '.cmd-icon-btn:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-1px}',
+      '.cmd-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}',
+      '.cmd-btn{appearance:none;box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;gap:4px;height:32px;border:1px solid var(--dsw-alias-border-l2,#d9d9d9);border-radius:16px;padding:0 14px;color:var(--dsw-alias-label-primary,#1f1f1f);background:transparent;cursor:pointer;font:inherit;font-size:13px;line-height:20px;white-space:nowrap}',
+      '.cmd-btn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,#f2f2f2)}',
+      '.cmd-btn-primary{border-color:transparent;color:var(--dsw-alias-label-primary-foreground,#fff);background:var(--dsw-alias-button-primary-fill,#1f1f1f)}',
+      '.cmd-btn-primary:hover:not(:disabled){background:var(--dsw-alias-button-primary-hover,#333)}',
+      '.cmd-text-btn{appearance:none;display:inline-flex;align-items:center;justify-content:center;height:28px;border:0;border-radius:14px;padding:0 10px;color:var(--dsw-alias-label-secondary,#6b6b6b);background:transparent;cursor:pointer;font:inherit;font-size:12.5px;line-height:18px}',
+      '.cmd-text-btn:hover:not(:disabled){color:var(--dsw-alias-label-primary,#1f1f1f);background:var(--dsw-alias-interactive-bg-hover,#f2f2f2)}',
+      '.cmd-input{width:100%;box-sizing:border-box;border:.5px solid var(--dsw-alias-border-l4,#d9d9d9);padding:9px 12px;border-radius:10px;background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-primary,#1f1f1f);font:inherit;font-size:13px}',
+      '.cmd-input:focus{outline:none;border-color:var(--dsw-alias-brand-primary,#4a7dff)}',
+      '.cmd-input::placeholder{color:var(--dsw-alias-label-dimmed,#9a9a9a)}',
+      '.cmd-textarea{width:100%;box-sizing:border-box;min-height:360px;border:.5px solid var(--dsw-alias-border-l4,#d9d9d9);padding:10px 12px;border-radius:10px;background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-primary,#1f1f1f);font-family:ui-monospace,Consolas,monospace;font-size:12.5px;line-height:1.6;resize:vertical}',
+      '.cmd-textarea:focus{outline:none;border-color:var(--dsw-alias-brand-primary,#4a7dff)}',
+      '.cmd-hint{color:var(--dsw-alias-label-tertiary,#6b6b6b)}',
+      '.cmd-err{color:var(--dsw-alias-state-error-primary,#c0392b)}',
+      '.cmd-ok{color:var(--dsw-alias-state-success-primary,#2f9e44)}',
+      '.cmd-field{display:flex;flex-direction:column;gap:6px}',
+      '.cmd-field-label{color:var(--dsw-alias-label-secondary,#6b6b6b);font-size:12px;font-weight:500}',
+      '.cmd-set-row{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;min-width:0;min-height:52px;padding:8px 0;border-top:1px solid var(--dsw-alias-border-l2,#e5e5e5);color:var(--dsw-alias-label-primary,#1f1f1f);font-size:13px;line-height:1.5}',
+      '.cmd-set-label{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}',
+      '.cmd-set-label b{font-size:14px;font-weight:500;color:var(--dsw-alias-label-primary,#1f1f1f);line-height:21px}',
+      '.cmd-set-label span{font-size:11px;color:var(--dsw-alias-label-tertiary,#8c8c8c);line-height:17px}',
+      '.cmd-perm{display:flex;flex-direction:column}',
+      '.cmd-perm>.cmd-set-row{padding:10px 0 8px}',
+      '.cmd-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;padding:0 0 14px;max-width:420px}',
+      '.cmd-fields label{display:flex;flex-direction:column;gap:5px;color:var(--dsw-alias-label-secondary,#6b6b6b);font-size:12px;line-height:16px;font-weight:500}',
+      '.cmd-fields input{width:100%;box-sizing:border-box;height:34px;border:.5px solid var(--dsw-alias-border-l4,#d9d9d9);border-radius:9px;padding:0 10px;background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-primary,#1f1f1f);font:inherit;font-size:13px}',
+      '.cmd-fields input:focus{outline:none;border-color:var(--dsw-alias-brand-primary,#4a7dff)}',
+      '.cmd-fields input:disabled{opacity:.45;cursor:default}',
+      '.cmd-fields-single{grid-template-columns:minmax(0,1fr);max-width:260px;padding-bottom:6px}',
       // 平铺项（注入预算）与开关标题同级：同字号、同字重、同主色，别再比大类小一号。
-      '.pmd-fields-lg label{font-size:14px;font-weight:500;color:var(--dsw-alias-label-primary,#1f1f1f);line-height:21px}',
-      '.pmd-switch{box-sizing:border-box;background:var(--dsw-alias-border-l3,#b8b8b8);cursor:pointer;border:0;border-radius:10px;flex:none;width:36px;height:20px;padding:2px;position:relative;transition:background-color .14s}',
-      '.pmd-switch-on{background:var(--dsw-alias-brand-primary,#4a7dff)}',
-      '.pmd-switch:disabled{cursor:default;opacity:.5}',
-      '.pmd-switch:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#4a7dff);outline-offset:2px}',
-      '.pmd-thumb{background:var(--dsw-alias-label-primary-foreground,#fff);border-radius:50%;width:16px;height:16px;transition:transform .12s;display:block}',
-      '.pmd-switch-on .pmd-thumb{transform:translate(16px)}',
-      '.pmd-journal{display:flex;flex-direction:column;gap:6px;min-height:360px}',
-      '.pmd-journal-foot{margin-top:auto;padding-top:6px}',
-      '.pmd-journal-row{display:flex;gap:12px;align-items:center;width:100%;box-sizing:border-box;text-align:left;font:inherit;color:inherit;background:transparent;cursor:pointer;padding:6px 10px;border-radius:8px;border:.5px solid var(--dsw-alias-border-l2,#e5e5e5)}',
-      '.pmd-journal-row:hover{background:var(--dsw-alias-interactive-bg-hover,#f5f5f5)}',
-      '.pmd-journal-row:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#4a7dff);outline-offset:-1px}',
-      '.pmd-journal-date{flex:none;width:108px;white-space:nowrap;font-variant-numeric:tabular-nums;font-weight:500;font-size:12.5px;color:var(--dsw-alias-label-primary,#1f1f1f)}',
-      '.pmd-journal-preview{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12.5px;color:var(--dsw-alias-label-tertiary,#6b6b6b)}',
-      '.pmd-viewer-dialog{width:min(640px,100%)}',
-      '.pmd-viewer{border:.5px solid var(--dsw-alias-border-l4,#d9d9d9);background:var(--dsw-alias-bg-layer-2,#f7f7f7);max-height:min(52vh,480px);color:var(--dsw-alias-label-secondary,#6b6b6b);font-family:var(--dsw-font-mono,ui-monospace,Consolas,monospace);white-space:pre-wrap;overflow-wrap:anywhere;border-radius:10px;margin:0;padding:12px;font-size:12.5px;line-height:1.6;overflow:auto}',
-      '.pmd-sep{height:1px;background:var(--dsw-alias-border-l2,#eee);margin:4px 0}',
-      '.pmd-dialog{width:min(480px,100%)}',
-      '.pmd-dialog-fields{display:flex;flex-direction:column;gap:12px}',
+      '.cmd-fields-lg label{font-size:14px;font-weight:500;color:var(--dsw-alias-label-primary,#1f1f1f);line-height:21px}',
+      '.cmd-switch{box-sizing:border-box;background:var(--dsw-alias-border-l3,#b8b8b8);cursor:pointer;border:0;border-radius:10px;flex:none;width:36px;height:20px;padding:2px;position:relative;transition:background-color .14s}',
+      '.cmd-switch-on{background:var(--dsw-alias-brand-primary,#4a7dff)}',
+      '.cmd-switch:disabled{cursor:default;opacity:.5}',
+      '.cmd-switch:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#4a7dff);outline-offset:2px}',
+      '.cmd-thumb{background:var(--dsw-alias-label-primary-foreground,#fff);border-radius:50%;width:16px;height:16px;transition:transform .12s;display:block}',
+      '.cmd-switch-on .cmd-thumb{transform:translate(16px)}',
+      /*
+       * 输入框工具栏里的伙伴下拉。尺寸对齐官方那一带的紧凑控件：
+       * 小圆角、单行、12~13px 字号，不抢视觉焦点。
+       */
+      '.cmd-picker{position:relative;display:inline-flex;align-items:center}',
+      '.cmd-chip{font:inherit;font-size:12px;line-height:18px;cursor:pointer;background:transparent;color:var(--dsw-alias-label-secondary,#6b6b6b);border:.5px solid var(--dsw-alias-border-l3,#d9d9d9);border-radius:8px;padding:2px 8px;white-space:nowrap}',
+      '.cmd-chip:hover{background:var(--dsw-alias-interactive-bg-hover,#f5f5f5);color:var(--dsw-alias-label-primary,#1f1f1f)}',
+      '.cmd-chip[data-open="1"]{background:var(--dsw-alias-interactive-bg-hover,#f5f5f5);color:var(--dsw-alias-label-primary,#1f1f1f)}',
+      '.cmd-chip:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#4a7dff);outline-offset:1px}',
+      // 锁定态：不可点，只作为"本次对话在用哪个伙伴"的指示
+      '.cmd-chip-locked{cursor:default;border-color:transparent;background:transparent;color:var(--dsw-alias-label-tertiary,#8c8c8c);padding-left:2px}',
+      '.cmd-menu{position:absolute;bottom:calc(100% + 6px);left:0;z-index:20;min-width:150px;max-height:260px;overflow-y:auto;padding:4px;background:var(--dsw-alias-bg-layer-1,#fff);border:.5px solid var(--dsw-alias-border-l2,#e5e5e5);border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.12);display:flex;flex-direction:column;gap:1px}',
+      '.cmd-menu-item{font:inherit;font-size:13px;line-height:20px;text-align:left;cursor:pointer;background:transparent;border:0;border-radius:7px;padding:6px 10px;color:var(--dsw-alias-label-primary,#1f1f1f);white-space:nowrap}',
+      '.cmd-menu-item:hover{background:var(--dsw-alias-interactive-bg-hover,#f5f5f5)}',
+      '.cmd-menu-item[data-on="1"]{background:var(--dsw-alias-interactive-bg-selected,#eef3ff);color:var(--dsw-alias-brand-primary,#4a7dff)}',
+      '.cmd-journal{display:flex;flex-direction:column;gap:6px;min-height:360px}',      '.cmd-journal-foot{margin-top:auto;padding-top:6px}',
+      '.cmd-journal-row{display:flex;gap:12px;align-items:center;width:100%;box-sizing:border-box;text-align:left;font:inherit;color:inherit;background:transparent;cursor:pointer;padding:6px 10px;border-radius:8px;border:.5px solid var(--dsw-alias-border-l2,#e5e5e5)}',
+      '.cmd-journal-row:hover{background:var(--dsw-alias-interactive-bg-hover,#f5f5f5)}',
+      '.cmd-journal-row:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#4a7dff);outline-offset:-1px}',
+      '.cmd-journal-date{flex:none;width:108px;white-space:nowrap;font-variant-numeric:tabular-nums;font-weight:500;font-size:12.5px;color:var(--dsw-alias-label-primary,#1f1f1f)}',
+      '.cmd-journal-preview{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12.5px;color:var(--dsw-alias-label-tertiary,#6b6b6b)}',
+      '.cmd-viewer-dialog{width:min(640px,100%)}',
+      '.cmd-viewer{border:.5px solid var(--dsw-alias-border-l4,#d9d9d9);background:var(--dsw-alias-bg-layer-2,#f7f7f7);max-height:min(52vh,480px);color:var(--dsw-alias-label-secondary,#6b6b6b);font-family:var(--dsw-font-mono,ui-monospace,Consolas,monospace);white-space:pre-wrap;overflow-wrap:anywhere;border-radius:10px;margin:0;padding:12px;font-size:12.5px;line-height:1.6;overflow:auto}',
+      '.cmd-sep{height:1px;background:var(--dsw-alias-border-l2,#eee);margin:4px 0}',
+      '.cmd-dialog{width:min(480px,100%)}',
+      '.cmd-dialog-fields{display:flex;flex-direction:column;gap:12px}',
       // 自建 Dialog 的定位与层级：原 Modal 自带这些，换成原生元素后必须自己补。
-      '.pmd-overlay{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;padding:24px;background:var(--dsw-alias-bg-mask-drop,rgba(0,0,0,.45))}',
-      '.pmd-dialog-sheet{width:min(560px,100%);max-height:min(80vh,720px);box-sizing:border-box;display:flex;flex-direction:column;gap:10px;padding:16px 18px;border-radius:14px;border:.5px solid var(--dsw-alias-border-l2,#e5e5e5);background:var(--dsw-alias-bg-overlay,#fff);color:var(--dsw-alias-label-primary,#1f1f1f);box-shadow:0 12px 40px rgba(0,0,0,.18)}',
-      '.pmd-dialog-head{display:flex;flex-direction:column;gap:2px}',
-      '.pmd-dialog-title{font-size:15px;font-weight:600;line-height:1.4;overflow-wrap:anywhere}',
-      '.pmd-dialog-sub{font-size:11.5px;color:var(--dsw-alias-label-tertiary,#8c8c8c)}',
-      '.pmd-dialog-foot{display:flex;justify-content:flex-end;gap:8px}',
+      '.cmd-overlay{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;padding:24px;background:var(--dsw-alias-bg-mask-drop,rgba(0,0,0,.45))}',
+      '.cmd-dialog-sheet{width:min(560px,100%);max-height:min(80vh,720px);box-sizing:border-box;display:flex;flex-direction:column;gap:10px;padding:16px 18px;border-radius:14px;border:.5px solid var(--dsw-alias-border-l2,#e5e5e5);background:var(--dsw-alias-bg-overlay,#fff);color:var(--dsw-alias-label-primary,#1f1f1f);box-shadow:0 12px 40px rgba(0,0,0,.18)}',
+      '.cmd-dialog-head{display:flex;flex-direction:column;gap:2px}',
+      '.cmd-dialog-title{font-size:15px;font-weight:600;line-height:1.4;overflow-wrap:anywhere}',
+      '.cmd-dialog-sub{font-size:11.5px;color:var(--dsw-alias-label-tertiary,#8c8c8c)}',
+      '.cmd-dialog-foot{display:flex;justify-content:flex-end;gap:8px}',
     ].join('\n')
 
     function ensureStyles() {
       if (typeof document === 'undefined') return
-      if (document.querySelector('style[data-preset-md-css]')) return
+      if (document.querySelector('style[data-companion-css]')) return
       const style = document.createElement('style')
-      style.setAttribute('data-preset-md-css', '1')
+      style.setAttribute('data-companion-css', '1')
       style.textContent = CSS
       document.head.appendChild(style)
     }
@@ -122,41 +148,72 @@ window.__ModuleLoader__.load({
     function Dialog({ open, onClose, title, description, footer, className, children }) {
       if (!open) return null
       return h('div', {
-        className: 'pmd-overlay',
+        className: 'cmd-overlay',
         role: 'dialog',
         'aria-modal': 'true',
         'aria-label': title,
         onClick: onClose,                       // 点遮罩关闭
       },
         h('div', {
-          className: `pmd-dialog-sheet ${className || ''}`.trim(),
+          className: `cmd-dialog-sheet ${className || ''}`.trim(),
           onClick: (event) => event.stopPropagation(),   // 点内容不关闭
         },
-          h('div', { className: 'pmd-dialog-head' },
-            h('div', { className: 'pmd-dialog-title' }, title),
-            description ? h('div', { className: 'pmd-dialog-sub' }, description) : null,
+          h('div', { className: 'cmd-dialog-head' },
+            h('div', { className: 'cmd-dialog-title' }, title),
+            description ? h('div', { className: 'cmd-dialog-sub' }, description) : null,
           ),
           children,
-          footer ? h('div', { className: 'pmd-dialog-foot' }, footer) : null,
+          footer ? h('div', { className: 'cmd-dialog-foot' }, footer) : null,
         ),
       )
     }
 
-    /* ── 内联图标（16×16，stroke 跟随 currentColor，可用 CSS 改色） ── */
+    /* ── 卡片底部三个图标 ──
+     *
+     * 优先用官方 primitives 的同名图标（IconBrowseOutline16 / IconCopyOutline16 /
+     * IconTrashOutline16），与官方预设卡片视觉一致；取不到时退回内联 SVG。
+     *
+     * 为什么必须带兜底：历史上曾在 factory 顶层直接解构该包，包取不到导致 factory
+     * 抛错 → apply 从不执行 → ensureStyles 不跑 → 整页裸 HTML（见
+     * docs/设置页裸样式-根因与修复.md）。而官方 dsh-client-ui-agent-preset 自己也在
+     * 顶层 require 同一个包，说明它由前端模块系统在运行时注入，Node 里
+     * require.resolve 失败并不代表浏览器里取不到 —— 所以不能静态判定，只能运行时探测。
+     *
+     * 探测放在 apply 之后、渲染之前，且只在渲染时取一次；try/catch 包住，
+     * 任何一种失败都只是退回 SVG，不会波及样式与整页。
+     */
 
     const ICON_PROPS = {
       width: 16, height: 16, viewBox: '0 0 16 16', fill: 'none',
       stroke: 'currentColor', strokeWidth: 1.5,
       strokeLinecap: 'round', strokeLinejoin: 'round',
     }
-    const IconBrowse = () => h('svg', ICON_PROPS,
+    const SvgBrowse = () => h('svg', ICON_PROPS,
       h('circle', { cx: 7, cy: 7, r: 4.5 }), h('path', { d: 'M10.5 10.5 L14 14' }))
-    const IconCopy = () => h('svg', ICON_PROPS,
+    const SvgCopy = () => h('svg', ICON_PROPS,
       h('rect', { x: 5.5, y: 5.5, width: 8, height: 8, rx: 1.5 }),
       h('path', { d: 'M10.5 5.5 V3.5 A1.5 1.5 0 0 0 9 2 H3.5 A1.5 1.5 0 0 0 2 3.5 V9 A1.5 1.5 0 0 0 3.5 10.5 H5.5' }))
-    const IconTrash = () => h('svg', ICON_PROPS,
+    const SvgTrash = () => h('svg', ICON_PROPS,
       h('path', { d: 'M2.5 4.5 H13.5' }), h('path', { d: 'M6 4.5 V3 A1 1 0 0 1 7 2 H9 A1 1 0 0 1 10 3 V4.5' }),
       h('path', { d: 'M4 4.5 L4.8 13 A1 1 0 0 0 5.8 14 H10.2 A1 1 0 0 0 11.2 13 L12 4.5' }))
+
+    /**
+     * 取官方图标。任何一步失败都返回 null，由调用点退回内联 SVG。
+     * 只读三个具名导出，不做整体解构 —— 缺其中一个不影响另外两个。
+     */
+    function pickOfficialIcon(name) {
+      try {
+        const primitives = require('@deepseek-ai/dsh-client-ui-primitives')
+        const Icon = primitives && primitives[name]
+        return typeof Icon === 'function' || typeof Icon === 'object' ? Icon : null
+      } catch {
+        return null
+      }
+    }
+
+    const IconBrowse = pickOfficialIcon('IconBrowseOutline16') || SvgBrowse
+    const IconCopy = pickOfficialIcon('IconCopyOutline16') || SvgCopy
+    const IconTrash = pickOfficialIcon('IconTrashOutline16') || SvgTrash
 
     async function call(path, options) {
       const response = await fetch(`${API}${path}`, options)
@@ -179,12 +236,12 @@ window.__ModuleLoader__.load({
     const json = (method, body) => ({ method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
 
     function TabBar({ tabs, value, onChange }) {
-      return h('div', { className: 'pmd-tabs' }, tabs.map((item) => h(
+      return h('div', { className: 'cmd-tabs' }, tabs.map((item) => h(
         'button',
         {
           key: item.key,
           type: 'button',
-          className: 'pmd-tab',
+          className: 'cmd-tab',
           'data-on': item.key === value ? '1' : '0',
           onClick: () => onChange(item.key),
         },
@@ -222,7 +279,7 @@ window.__ModuleLoader__.load({
 
       React.useEffect(() => { load() }, [load])
 
-      if (!saved) return h('div', { className: 'pmd-hint' }, message || '加载中…')
+      if (!saved) return h('div', { className: 'cmd-hint' }, message || '加载中…')
 
       /*
        * 表单值一律转成字符串：数字框要能承载「空」这个状态
@@ -250,9 +307,9 @@ window.__ModuleLoader__.load({
         role: 'switch',
         'aria-checked': Boolean(form[key]),
         'aria-label': key,
-        className: 'pmd-switch' + (form[key] ? ' pmd-switch-on' : ''),
+        className: 'cmd-switch' + (form[key] ? ' cmd-switch-on' : ''),
         onClick: () => patch({ [key]: !form[key] }),
-      }, h('span', { className: 'pmd-thumb' }))
+      }, h('span', { className: 'cmd-thumb' }))
 
       /**
        * 数字参数：标签在上、输入在下。
@@ -310,8 +367,8 @@ window.__ModuleLoader__.load({
         }
       }
 
-      const setRow = (key, title, desc) => h('div', { className: 'pmd-set-row', key },
-        h('span', { className: 'pmd-set-label' },
+      const setRow = (key, title, desc) => h('div', { className: 'cmd-set-row', key },
+        h('span', { className: 'cmd-set-label' },
           h('b', null, title),
           desc ? h('span', null, desc) : null),
         toggle(key))
@@ -324,30 +381,30 @@ window.__ModuleLoader__.load({
         '各文件按固定比例瓜分这份预算（MEMORY 25% / AGENTS 22% / SOUL 20% / IDENTITY 13% / SYSTEM 12% / USER 8%），' +
         '单个文件偏大但总量没超不会提示。'
 
-      return h('div', { className: 'pmd-root' },
-        h('div', { className: 'pmd-hint' }, '改动点「保存」后生效；运行中的会话下一个回合就会按新值走。'),
-        h('div', { className: 'pmd-perm' },
+      return h('div', { className: 'cmd-root' },
+        h('div', { className: 'cmd-hint' }, '改动点「保存」后生效；运行中的会话下一个回合就会按新值走。'),
+        h('div', { className: 'cmd-perm' },
           setRow('autoMemory', '自动记忆',
             '开：后台自动整理日记、更新记忆。关：不写日记也不动记忆，只有手动检索可用。'),
-          h('div', { className: 'pmd-fields' },
+          h('div', { className: 'cmd-fields' },
             num('reviewTurns', '触发轮数', 1, undefined, '轮'),
             num('reviewChars', '触发字符数', 200, 200, '字符')),
-          h('div', { className: 'pmd-sep' }),
-          h('div', { className: 'pmd-fields pmd-fields-single pmd-fields-lg' },
+          h('div', { className: 'cmd-sep' }),
+          h('div', { className: 'cmd-fields cmd-fields-single cmd-fields-lg' },
             num('contextBudget', '注入预算', 2000, 1000, '字符', false)),
           setRow('budgetNotice', '超限提醒',
             '开：六个文件总量超出预算时，在提示词末尾附一段「请收敛」提醒，让模型自己精简。' +
             '关：只度量并打日志，不往提示词里加任何东西。两种情况都不硬截断。' + budgetHint)),
-        h('div', { className: 'pmd-row' },
+        h('div', { className: 'cmd-row' },
           h('button', {
-            className: 'pmd-btn pmd-btn-primary',
+            className: 'cmd-btn cmd-btn-primary',
             type: 'button',
             // 有未保存改动时才可点，避免无谓的接口调用。
             disabled: saving || !dirty,
             onClick: () => { void save() },
           }, saving ? '保存中…' : '保存'),
-          dirty && !saving ? h('span', { className: 'pmd-hint' }, '有未保存的改动') : null,
-          message ? h('span', { className: dirty ? 'pmd-hint' : 'pmd-ok' }, message) : null),
+          dirty && !saving ? h('span', { className: 'cmd-hint' }, '有未保存的改动') : null,
+          message ? h('span', { className: dirty ? 'cmd-hint' : 'cmd-ok' }, message) : null),
       )
     }
 
@@ -428,16 +485,16 @@ window.__ModuleLoader__.load({
         onClose: closeCopy,
         title: '复制伙伴',
         closeLabel: '关闭',
-        className: 'pmd-dialog',
+        className: 'cmd-dialog',
         description: `以「${copyFrom.name}」为模板复制一个新伙伴，保留性格与内容，不带历史日记。`,
         footer: h(React.Fragment, null,
-          h('button', { type: 'button', className: 'pmd-btn', disabled: copying, onClick: closeCopy }, '取消'),
-          h('button', { type: 'button', className: 'pmd-btn pmd-btn-primary', disabled: copying || !copyName.trim(), onClick: confirmCopy }, copying ? '复制中…' : '复制')),
-      }, h('div', { className: 'pmd-dialog-fields' },
-        h('label', { className: 'pmd-field' },
-          h('span', { className: 'pmd-field-label' }, '新伙伴昵称'),
+          h('button', { type: 'button', className: 'cmd-btn', disabled: copying, onClick: closeCopy }, '取消'),
+          h('button', { type: 'button', className: 'cmd-btn cmd-btn-primary', disabled: copying || !copyName.trim(), onClick: confirmCopy }, copying ? '复制中…' : '复制')),
+      }, h('div', { className: 'cmd-dialog-fields' },
+        h('label', { className: 'cmd-field' },
+          h('span', { className: 'cmd-field-label' }, '新伙伴昵称'),
           h('input', {
-            className: 'pmd-input',
+            className: 'cmd-input',
             value: copyName,
             autoFocus: true,
             spellCheck: false,
@@ -445,44 +502,44 @@ window.__ModuleLoader__.load({
             onChange: (event) => { setCopyName(event.target.value); setCopyError('') },
             onKeyDown: (event) => { if (event.key === 'Enter') confirmCopy() },
           })),
-        copyError ? h('p', { className: 'pmd-err', role: 'alert' }, copyError) : null)) : null
+        copyError ? h('p', { className: 'cmd-err', role: 'alert' }, copyError) : null)) : null
 
-      return h('div', { className: 'pmd-root' },
-        h('div', { className: 'pmd-row' },
+      return h('div', { className: 'cmd-root' },
+        h('div', { className: 'cmd-row' },
           h('input', {
-            className: 'pmd-input',
+            className: 'cmd-input',
             style: { maxWidth: '220px' },
             placeholder: '新伙伴的昵称',
             value: newName,
             onChange: (event) => setNewName(event.target.value),
             onKeyDown: (event) => { if (event.key === 'Enter') create() },
           }),
-          h('button', { className: 'pmd-btn pmd-btn-primary', type: 'button', onClick: create }, '新建伙伴')),
-        h('div', { className: 'pmd-hint' }, message || '新建后请刷新 DSH，新会话里即可选择该伙伴。'),
-        h('div', { className: 'pmd-sep' }),
-        h('div', { className: 'pmd-cards' }, agents.map((agent) => h('article', { className: 'pmd-card', key: agent.id },
-          h('div', { className: 'pmd-card-main' },
-            h('div', { className: 'pmd-card-head' },
-              h('span', { className: 'pmd-card-name' }, agent.name)),
-            h('div', { className: 'pmd-card-desc' }, agent.description || '（还没有个性签名）'),
-            h('div', { className: 'pmd-card-id' }, agent.id)),
-          h('footer', { className: 'pmd-card-foot' },
+          h('button', { className: 'cmd-btn cmd-btn-primary', type: 'button', onClick: create }, '新建伙伴')),
+        h('div', { className: 'cmd-hint' }, message || '新建后请刷新 DSH，新会话里即可选择该伙伴。'),
+        h('div', { className: 'cmd-sep' }),
+        h('div', { className: 'cmd-cards' }, agents.map((agent) => h('article', { className: 'cmd-card', key: agent.id },
+          h('div', { className: 'cmd-card-main' },
+            h('div', { className: 'cmd-card-head' },
+              h('span', { className: 'cmd-card-name' }, agent.name)),
+            h('div', { className: 'cmd-card-desc' }, agent.description || '（还没有个性签名）'),
+            h('div', { className: 'cmd-card-id' }, agent.id)),
+          h('footer', { className: 'cmd-card-foot' },
             h('button', {
-              className: 'pmd-icon-btn',
+              className: 'cmd-icon-btn',
               type: 'button',
               title: '查看',
               'aria-label': `查看：${agent.name}`,
               onClick: () => onOpen(agent.id),
             }, h(IconBrowse)),
             h('button', {
-              className: 'pmd-icon-btn',
+              className: 'cmd-icon-btn',
               type: 'button',
               title: '复制',
               'aria-label': `复制：${agent.name}`,
               onClick: () => openCopy(agent),
             }, h(IconCopy)),
             h('button', {
-              className: 'pmd-icon-btn pmd-icon-btn-danger',
+              className: 'cmd-icon-btn cmd-icon-btn-danger',
               type: 'button',
               title: '删除',
               disabled: deleting === agent.id,
@@ -530,12 +587,12 @@ window.__ModuleLoader__.load({
       }
 
       if (!loaded) {
-        return h('div', { className: 'pmd-journal' },
-          h('div', { className: 'pmd-hint' }, '加载中…'))
+        return h('div', { className: 'cmd-journal' },
+          h('div', { className: 'cmd-hint' }, '加载中…'))
       }
       if (rows.length === 0) {
-        return h('div', { className: 'pmd-journal' },
-          h('div', { className: 'pmd-hint' }, '还没有日记。'))
+        return h('div', { className: 'cmd-journal' },
+          h('div', { className: 'cmd-hint' }, '还没有日记。'))
       }
 
       const shown = expanded ? rows : rows.slice(0, JOURNAL_VISIBLE_DAYS)
@@ -546,24 +603,24 @@ window.__ModuleLoader__.load({
         onClose: () => setViewing(null),
         title: viewing ? `日记 · ${viewing}` : '',
         closeLabel: '关闭',
-        className: 'pmd-viewer-dialog',
+        className: 'cmd-viewer-dialog',
         description: '这一天的日记内容，只读。',
-        footer: h('button', { type: 'button', className: 'pmd-btn', autoFocus: true, onClick: () => setViewing(null) }, '关闭'),
-      }, h('pre', { className: 'pmd-viewer' }, loading ? '读取中…' : text))
+        footer: h('button', { type: 'button', className: 'cmd-btn', autoFocus: true, onClick: () => setViewing(null) }, '关闭'),
+      }, h('pre', { className: 'cmd-viewer' }, loading ? '读取中…' : text))
 
-      return h('div', { className: 'pmd-journal' },
+      return h('div', { className: 'cmd-journal' },
         shown.map((row) => h('button', {
           key: row.date,
           type: 'button',
-          className: 'pmd-journal-row',
+          className: 'cmd-journal-row',
           onClick: () => view(row.date),
         },
-        h('span', { className: 'pmd-journal-date' }, row.date),
-        h('span', { className: 'pmd-journal-preview' }, row.preview || '（空）'))),
+        h('span', { className: 'cmd-journal-date' }, row.date),
+        h('span', { className: 'cmd-journal-preview' }, row.preview || '（空）'))),
         hidden > 0 || expanded
-          ? h('div', { className: 'pmd-row pmd-journal-foot' },
+          ? h('div', { className: 'cmd-row cmd-journal-foot' },
             h('button', {
-              className: 'pmd-text-btn',
+              className: 'cmd-text-btn',
               type: 'button',
               onClick: () => setExpanded(!expanded),
             }, expanded ? '收起，只看最近 7 天' : `展开更早的 ${hidden} 天`))
@@ -592,7 +649,7 @@ window.__ModuleLoader__.load({
       }, [id])
       React.useEffect(() => { load() }, [load])
 
-      if (!agent) return h('div', { className: 'pmd-hint' }, message || '加载中…')
+      if (!agent) return h('div', { className: 'cmd-hint' }, message || '加载中…')
 
       /**
        * 当前页签有没有未保存的改动。
@@ -656,35 +713,35 @@ window.__ModuleLoader__.load({
       const tabs = MD_TABS.map((item) => ({ key: item.file, label: item.label }))
       tabs.push({ key: 'journal', label: '日记' })
 
-      return h('div', { className: 'pmd-root' },
-        h('div', { className: 'pmd-row' },
-          h('button', { className: 'pmd-text-btn', type: 'button', onClick: onBack }, '← 返回'),
-          h('span', { className: 'pmd-hint' }, id)),
-        h('label', { className: 'pmd-field' },
-          h('span', { className: 'pmd-field-label' }, '昵称'),
-          h('input', { className: 'pmd-input', value: name, onChange: (event) => setName(event.target.value) })),
-        h('label', { className: 'pmd-field' },
-          h('span', { className: 'pmd-field-label' }, '个性签名'),
-          h('input', { className: 'pmd-input', value: description, onChange: (event) => setDescription(event.target.value) })),
-        h('div', { className: 'pmd-row' },
-          h('button', { className: 'pmd-btn pmd-btn-primary', type: 'button', onClick: saveMeta }, '保存昵称/签名'),
-          h('span', { className: 'pmd-hint' }, message)),
-        h('div', { className: 'pmd-sep' }),
+      return h('div', { className: 'cmd-root' },
+        h('div', { className: 'cmd-row' },
+          h('button', { className: 'cmd-text-btn', type: 'button', onClick: onBack }, '← 返回'),
+          h('span', { className: 'cmd-hint' }, id)),
+        h('label', { className: 'cmd-field' },
+          h('span', { className: 'cmd-field-label' }, '昵称'),
+          h('input', { className: 'cmd-input', value: name, onChange: (event) => setName(event.target.value) })),
+        h('label', { className: 'cmd-field' },
+          h('span', { className: 'cmd-field-label' }, '个性签名'),
+          h('input', { className: 'cmd-input', value: description, onChange: (event) => setDescription(event.target.value) })),
+        h('div', { className: 'cmd-row' },
+          h('button', { className: 'cmd-btn cmd-btn-primary', type: 'button', onClick: saveMeta }, '保存昵称/签名'),
+          h('span', { className: 'cmd-hint' }, message)),
+        h('div', { className: 'cmd-sep' }),
         h(TabBar, { tabs, value: tab, onChange: pickTab }),
         tab === 'journal'
           ? h(JournalTab, { id })
-          : h('div', { className: 'pmd-root' },
-            h('textarea', { className: 'pmd-textarea', value: draft, onChange: (event) => setDraft(event.target.value) }),
-            h('div', { className: 'pmd-row' },
+          : h('div', { className: 'cmd-root' },
+            h('textarea', { className: 'cmd-textarea', value: draft, onChange: (event) => setDraft(event.target.value) }),
+            h('div', { className: 'cmd-row' },
               // 有未保存改动时才可点：与「参数」页签同一套门控，避免无谓的接口调用
               h('button', {
-                className: 'pmd-btn pmd-btn-primary',
+                className: 'cmd-btn cmd-btn-primary',
                 type: 'button',
                 disabled: !dirty,
                 onClick: saveFile,
               }, '保存'),
               h('button', {
-                className: 'pmd-text-btn',
+                className: 'cmd-text-btn',
                 type: 'button',
                 disabled: !dirty,
                 onClick: () => {
@@ -699,7 +756,7 @@ window.__ModuleLoader__.load({
                */
               conflict
                 ? h('button', {
-                  className: 'pmd-text-btn',
+                  className: 'cmd-text-btn',
                   type: 'button',
                   onClick: () => {
                     setMessage('')
@@ -707,8 +764,165 @@ window.__ModuleLoader__.load({
                   },
                 }, '重新载入')
                 : null,
-              dirty && !conflict ? h('span', { className: 'pmd-hint' }, '有未保存的改动') : null,
-              message ? h('span', { className: conflict ? 'pmd-err' : 'pmd-hint' }, message) : null)),
+              dirty && !conflict ? h('span', { className: 'cmd-hint' }, '有未保存的改动') : null,
+              message ? h('span', { className: conflict ? 'cmd-err' : 'cmd-hint' }, message) : null)),
+      )
+    }
+
+    /* ────────────────────── 输入框工具栏的伙伴下拉 ──────────────────────
+     *
+     * 挂在官方 slot `conversation.input.left`（"Compact controls at the left of
+     * the composer tool row"）。官方对该 slot 的约定是：
+     *
+     *   "Use an id of your own: a fresh id is added **beside** the shipped
+     *    entries, while reusing a shipped id puts you in THAT cell and replaces it."
+     *
+     * 所以我们用一个自有 id —— **不会顶掉官方任何一个控件**。
+     *
+     * ## 为什么在输入框而不是"新建对话"那一屏
+     *
+     * 新建对话的 Hero 区只有三个 slot（brand.mark / workspace / agentPreset），
+     * 全是 `single` 且被官方占据；而 slot 只能由**声明它的组件**渲染
+     * （官方原话："Declaring is claiming"），插件无法往那一行里追加控件。
+     * 输入框工具栏是 `list`、可追加，且它在新建对话时同样可见 ——
+     * 于是"开对话前选伙伴"这个交互得以保留。
+     *
+     * ## 锁定规则
+     *
+     * - `blank`（会话还没开始）：可选
+     * - 已经开始（首轮已发出）：只读展示，改不了 —— 见官方
+     *   `SessionSnapshot.awaitingFirstTurn` 的语义
+     */
+
+    /** 会话是否还处于"可改绑定"的窗口。 */
+    function canPickCompanion(session) {
+      if (!session) return false
+      // 还没开始：可选。已经跑起来（首轮已提交）：锁定。
+      if (session.blank === false) return false
+      if (session.promptAttempted === true) return false
+      return true
+    }
+
+    /** useSession 缺失时的空实现：保证 hook 调用次数恒定，不破坏 hook 顺序。 */
+    const noSession = () => undefined
+    /** useSessions 缺失时的空实现：同上，保持 hook 次数恒定。 */
+    const noSessions = () => undefined
+
+    /**
+     * 当前会话挂的是哪个官方预设。
+     *
+     * 读法照抄官方 AgentPresetLabel（dsh-client-ui-agent-preset/lib/client.js:359-363）：
+     * `useSessions` 的列表投影里，每个会话的 `projectionValues.agentPreset`。
+     * blank 新会话 / 旧版本没有该值时返回 undefined —— 与官方同语义。
+     */
+    function useSessionPreset(props) {
+      const useSessions = props.useSessions ?? noSessions
+      const sessionId = props.sessionId
+      return useSessions((state) => {
+        const value = state?.byId?.[sessionId]?.projectionValues?.agentPreset
+        return typeof value === 'string' ? value : undefined
+      })
+    }
+
+    function CompanionPicker(props) {
+      /*
+       * ⚠️ 会话身份**不能**取 `props.session` —— 该 slot 的官方 props 表里
+       * 没有这个名字。官方声明处是 `renderSlot("conversation.input.left", {})`
+       * （dsh-client-ui-conversation/lib/client.js:17447），传入的是**空对象**；
+       * 会话身份由 standard kit 以 `sessionId` + `useSession` 注入。
+       *
+       * 用不存在的 prop 会让 session 恒为 undefined，`canPickCompanion` 于是
+       * 判为"已锁定"，控件退化成只读小标签 —— 下拉框永远出不来。
+       *
+       * ## 显形条件：仅「伙伴模式」预设
+       *
+       * 伙伴下拉只在会话挂了本插件注册的「伙伴模式」预设时出现；
+       * 其他任何预设（standard / standard-gitbash / ptc…）**完全不渲染**，
+       * 编码会话的输入栏与官方原样一致，一个像素都不占。
+       * 注意判断放在**所有 hook 之后**：不能因为不显形就少调 hook。
+       */
+      const sessionId = props.sessionId
+      const useSession = props.useSession ?? noSession
+      const session = useSession((snapshot) => snapshot)
+      const presetId = useSessionPreset(props)
+      const [state, setState] = React.useState({ phase: 'loading', list: [], current: null, open: false })
+      const locked = !canPickCompanion(session)
+
+      // ── 显形闸门：仅「伙伴模式」预设 ──
+      // 放在所有 hook 之后（hook 次数必须恒定）；不显形时不发请求、不渲染。
+      if (presetId !== COMPANION_PRESET_ID) return null
+
+      React.useEffect(() => {
+        let alive = true
+        /*
+         * 路径是 `/companions`，**不是** `/api/companions`。
+         *
+         * `API` 已经带了 `/api` 段（见文件顶部的 `const API = '/companion/api'`），
+         * 再写一次会拼成 `/companion/api/api/companions` → 404 → 下面 catch 把
+         * phase 置为 error → `return null`，于是**静默什么都不显示**。
+         * 带上 session 是为了让服务端回 `current`（当前绑定）。
+         */
+        const query = sessionId ? `?session=${encodeURIComponent(sessionId)}` : ''
+        call(`/companions${query}`)
+          .then((payload) => {
+            if (!alive) return
+            setState((prev) => ({ ...prev, phase: 'ready', list: payload.companions || [], current: payload.current ?? null }))
+          })
+          .catch(() => {
+            if (alive) setState((prev) => ({ ...prev, phase: 'error' }))
+          })
+        return () => { alive = false }
+      }, [sessionId])
+
+      async function pick(id) {
+        setState((prev) => ({ ...prev, open: false }))
+        try {
+          const payload = await call('/companion', json('PUT', { companion: id, session: sessionId }))
+          setState((prev) => ({ ...prev, current: payload.current ?? null }))
+        } catch (error) {
+          setState((prev) => ({ ...prev, error: String(error && error.message ? error.message : error) }))
+        }
+      }
+
+      if (state.phase === 'loading') return null
+      if (state.phase === 'error') return null
+      // 一个伙伴都没有：不占位置（用户还没建伙伴时不该出现空下拉）
+      if (state.list.length === 0) return null
+
+      const currentName = state.current
+        ? ((state.list.find((item) => item.id === state.current) || {}).name || state.current)
+        : '无伙伴'
+
+      if (locked) {
+        // 锁定后只读展示：开对话后绑定不可改（用户明确要求）
+        return h('span', { className: 'cmd-chip cmd-chip-locked', title: '本次对话已开始，伙伴不可更改' }, currentName)
+      }
+
+      return h('div', { className: 'cmd-picker' },
+        h('button', {
+          type: 'button',
+          className: 'cmd-chip',
+          'data-open': state.open ? '1' : '0',
+          onClick: () => setState((prev) => ({ ...prev, open: !prev.open })),
+        }, `${currentName} ▾`),
+        state.open
+          ? h('div', { className: 'cmd-menu' },
+            h('button', {
+              key: '__none__',
+              type: 'button',
+              className: 'cmd-menu-item',
+              'data-on': state.current ? '0' : '1',
+              onClick: () => pick(null),
+            }, '无伙伴（用官方提示词）'),
+            state.list.map((item) => h('button', {
+              key: item.id,
+              type: 'button',
+              className: 'cmd-menu-item',
+              'data-on': item.id === state.current ? '1' : '0',
+              onClick: () => pick(item.id),
+            }, item.name || item.id)))
+          : null,
+        state.error ? h('span', { className: 'cmd-err' }, state.error) : null,
       )
     }
 
@@ -718,7 +932,7 @@ window.__ModuleLoader__.load({
       const [tab, setTab] = React.useState('agents')
       const [openId, setOpenId] = React.useState(null)
 
-      return h('div', { className: 'pmd-root' },
+      return h('div', { className: 'cmd-root' },
         h(TabBar, {
           tabs: [{ key: 'agents', label: '伙伴' }, { key: 'params', label: '参数' }],
           value: tab,
@@ -749,8 +963,21 @@ window.__ModuleLoader__.load({
         { name: 'settings.section', id: SECTION_ID, order: 21, label: '伙伴设置' },
         PartnerSettings,
       ))
+      /*
+       * 伙伴下拉：挂在输入框工具栏左侧，用**自有 id** 追加，
+       * 不占用官方任何一格（官方契约："a fresh id is added beside the
+       * shipped entries"）。取不到该 slot 时静默跳过，不影响设置页。
+       */
+      try {
+        slots.inject('conversation.input.left', () => slots.register(
+          { name: 'conversation.input.left', id: COMPANION_SLOT_ID, order: 10, label: '伙伴' },
+          CompanionPicker,
+        ))
+      } catch {
+        /* 该 slot 不存在（旧版 dsh）时不影响其余功能 */
+      }
     }
 
-    return { apply, inject: ['slots'], name: 'preset-md-client' }
+    return { apply, inject: ['slots'], name: 'companion-client' }
   },
 })

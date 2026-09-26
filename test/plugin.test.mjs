@@ -4,21 +4,25 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 import { apply, inject, localTimestamp, MAX_REVIEW_ATTEMPTS, name } from '../src/preset.js'
+import { createSessionFreeze } from '../src/core.js'
 import { dateKey } from '../src/memory-store.mjs'
 import { resolvePaths, writeSettings } from '../src/settings.mjs'
 
+/** 官方会话格式 v4 的准入函数（真包）：用来校验本插件写出的消息 source。 */
+const assertV4RowAdmission = (await import('@deepseek-ai/dsh-session-format-v3-to-v4')).assertV4RowAdmission
+
 /*
- * 隔离 DSH_HOME：apply() 会读 `<DSH_HOME>/preset-md/settings.json`。
+ * 隔离 DSH_HOME：apply() 会读 `<DSH_HOME>/companion/settings.json`。
  * 不隔离就会读真实用户的设置——本机 reviewTurns 被改成 1 时，
  * 「轮数不足不触发」这类依赖默认阈值的用例会直接失败（结果随本机配置漂移）。
  */
-const TEST_HOME = mkdtempSync(join(tmpdir(), 'preset-md-home-'))
+const TEST_HOME = mkdtempSync(join(tmpdir(), 'companion-home-'))
 process.env.DSH_HOME = TEST_HOME
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 20))
@@ -130,7 +134,7 @@ const agentWith = (text) => ({
 })
 
 test('导出：name / inject', () => {
-  assert.equal(name, 'preset-md')
+  assert.equal(name, 'companion')
   // llm 是硬依赖：回顾最后一步要调 ctx.llm.stream。不声明 inject 会被 Cordis
   // 的属性访问守卫拦下（cannot get property "llm" without inject）。
   assert.deepEqual(inject, ['systemPrompt', 'tools'])
@@ -173,24 +177,31 @@ test('防回归：源码里用到的 ctx 服务都必须在 inject 里声明', (
   assert.deepEqual(missing, [], `这些 ctx.<服务> 属性访问没写进 inject，或应改用 ctx.get()：${missing.join(', ')}`)
 })
 
-test('apply：注册唯一 complete section + 承载内容的变量（不再抑制运行时上下文）', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'preset-md-entry-'))
+test('apply：只做工具收窄与自动记忆，不再碰提示词 section（不再抑制运行时上下文）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'companion-entry-'))
   writeFileSync(join(dir, 'SOUL.md'), '人格', 'utf8')
   const ctx = makeCtx(dir)
   apply(ctx, {})
 
-  assert.deepEqual(ctx.sections, [{ name: 'preset-md', order: 0, text: '{{preset_md}}', complete: true }])
-  assert.equal(ctx.variables.get('preset_md')({ agent: { session: { id: 's1' } } }), '人格')
+  // 提示词注入已搬到 host 半按会话注册 —— 见文件末尾那条职责守卫。
+  assert.deepEqual(ctx.sections, [], 'preset 行插件不该注册任何 section')
+  assert.equal(ctx.variables.has('companion_persona'), false, 'preset 行插件不该注册提示词变量')
   // 抑制运行时上下文整块已按需求移除：实际收益很小（skill 目录、审批通知都是对话消息，抑制不了）
   assert.equal(ctx.stats.suppressed, 0, '不应再调用 suppressRuntimeContext')
-  // 装配信息已合并成一行（目录 / 参数 / section / 文件清单），不再逐项刷屏
-  assert.ok(ctx.logs.info.join('\n').includes('[preset-md] 装配 目录='))
+  /*
+   * 装配信息合并成一行。注意**不打印提示词 section**：它已不在这里注册，
+   * 且伙伴是按会话绑定的，插件启动时还没有会话，打出来只会误导。
+   */
+  const info = ctx.logs.info.join('\n')
+  assert.ok(info.includes('[companion] 装配'))
+  assert.ok(info.includes('伙伴目录='), '应报出伙伴存放根目录')
+  assert.ok(info.includes('提示词按会话绑定注入'), '应说明提示词的注入时机')
   assert.equal(ctx.logs.warn.length, 0)
   rmSync(dir, { recursive: true, force: true })
 })
 
 test('apply：注册三个记忆工具，tools.deny 下发收窄', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'preset-md-tools-'))
+  const dir = mkdtempSync(join(tmpdir(), 'companion-tools-'))
   const ctx = makeCtx(dir)
   apply(ctx, { tools: { deny: ['mnemon*'] } })
 
@@ -202,16 +213,24 @@ test('apply：注册三个记忆工具，tools.deny 下发收窄', () => {
   rmSync(dir, { recursive: true, force: true })
 })
 
-test('apply：目录未知时只 warn，不注册记忆工具、不挂自动记忆', () => {
+test('apply：没有伙伴目录时工具仍注册，但调用时不做任何事', () => {
+  /*
+   * 语义在本轮变了，这里锁的是**新语义**：
+   *
+   * 工具是**按 agent 注册**的，而伙伴要等会话绑定时才知道，所以 apply 阶段
+   * 不再因为"暂时没有目录"就跳过注册 —— 否则"先建会话、后选伙伴"就永远
+   * 拿不到记忆工具。注册照旧，取不到目录时由工具自己拒绝执行。
+   */
   const ctx = makeCtx(undefined)
   apply(ctx, {})
-  assert.equal(ctx.registered.length, 0)
-  assert.equal(ctx.listeners.size, 0)
-  assert.ok(ctx.logs.warn.join('').includes('无法确定预设目录'))
+  assert.equal(ctx.registered.length, 3, '三个记忆工具都应注册')
+  // 目录取不到时，工具调用会给出明确拒绝而不是瞎写一个目录
+  const journal = ctx.registered.find((tool) => tool.name === 'preset_md_journal')
+  assert.equal(typeof journal?.execute, 'function')
 })
 
 test('apply：单个工具注册失败不影响其余工具', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'preset-md-partial-'))
+  const dir = mkdtempSync(join(tmpdir(), 'companion-partial-'))
   const ctx = makeCtx(dir)
   let calls = 0
   ctx.tools.register = (definition) => {
@@ -231,7 +250,7 @@ test('apply：单个工具注册失败不影响其余工具', () => {
 })
 
 test('自动记忆：轮数不足不触发，达到阈值触发一次', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'preset-md-auto-'))
+  const dir = mkdtempSync(join(tmpdir(), 'companion-auto-'))
   const ctx = makeCtx(dir)
   apply(ctx, {})
   const turnStopping = ctx.first('agent/turn-stopping')
@@ -251,23 +270,37 @@ test('自动记忆：轮数不足不触发，达到阈值触发一次', async ()
 })
 
 test('自动记忆：会话结束必触发，并清掉该会话的冻结缓存', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'preset-md-disposed-'))
+  const dir = mkdtempSync(join(tmpdir(), 'companion-disposed-'))
   writeFileSync(join(dir, 'SOUL.md'), '第一版', 'utf8')
   const ctx = makeCtx(dir)
   apply(ctx, {})
-  const read = ctx.variables.get('preset_md')
-  assert.equal(read({ agent: { session: { id: 's1' } } }), '第一版')
-
-  writeFileSync(join(dir, 'SOUL.md'), '第二版', 'utf8')
-  assert.equal(read({ agent: { session: { id: 's1' } } }), '第一版')
 
   const disposed = ctx.first('agent/disposed')
   disposed({ agent: agentWith('y'.repeat(200)) })
   await tick()
 
+  // 会话结束必触发一次回顾（这条不受提示词搬迁影响）
   assert.equal(ctx.stats.streams, 1)
-  assert.equal(read({ agent: { session: { id: 's1' } } }), '第二版')
   rmSync(dir, { recursive: true, force: true })
+})
+
+test('提示词缓存随会话清理（冻结缓存的释放点仍在 core）', () => {
+  /*
+   * 早先这条挂在 `apply` 的 agent/disposed 里清 `prompt.cache`。提示词注入
+   * 搬到 host 半之后，preset 行插件不再持有那个缓存，所以这里改为直接验证
+   * `createSessionFreeze` 本身：会话级缓存必须能被按键释放。
+   *
+   * 为什么值得单列：缓存若不释放，长跑进程里每个会话都会留下一条渲染结果，
+   * Map 只增不减。释放逻辑本身仍在 core，只是调用方换了。
+   */
+  const cache = createSessionFreeze()
+  cache.get('s1', () => '第一版')
+  assert.equal(cache.get('s1', () => '第二版'), '第一版', '同键命中冻结值')
+  assert.equal(cache.size, 1)
+
+  cache.clear('s1')
+  assert.equal(cache.size, 0, '释放后不应再占用')
+  assert.equal(cache.get('s1', () => '第二版'), '第二版', '释放后重新求值')
 })
 
 test('自动记忆：上下文压缩前强制归档（否则那段内容压缩后再无机会总结）', async () => {
@@ -278,7 +311,7 @@ test('自动记忆：上下文压缩前强制归档（否则那段内容压缩�
    * 监听口径：session/event 给的是 session，schedule() 需要 agent，
    * 故本插件从 agent/created 建映射表。
    */
-  const dir = mkdtempSync(join(tmpdir(), 'preset-md-compact-'))
+  const dir = mkdtempSync(join(tmpdir(), 'companion-compact-'))
   const ctx = makeCtx(dir)
   apply(ctx, {})
   assert.equal(typeof ctx.first('session/event'), 'function', '必须监听 session/event')
@@ -311,7 +344,7 @@ test('自动记忆：上下文压缩前强制归档（否则那段内容压缩�
 })
 
 test('自动记忆：关闭 autoMemory 时压缩不触发归档', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'preset-md-compact-off-'))
+  const dir = mkdtempSync(join(tmpdir(), 'companion-compact-off-'))
   const ctx = makeCtx(dir)
   apply(ctx, {})
   writeSettings(resolvePaths(), { autoMemory: false })
@@ -327,7 +360,7 @@ test('自动记忆：关闭 autoMemory 时压缩不触发归档', async () => {
 })
 
 test('自动记忆：会话结束绕过防抖（刚触发过也要归档最后一段）', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'preset-md-force-'))
+  const dir = mkdtempSync(join(tmpdir(), 'companion-force-'))
   const ctx = makeCtx(dir)
   apply(ctx, {})
   const turnStopping = ctx.first('agent/turn-stopping')
@@ -347,7 +380,7 @@ test('自动记忆：会话结束绕过防抖（刚触发过也要归档最后�
 })
 
 test('自动记忆：回顾进行中结束会话，结束后补跑一次', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'preset-md-pending-'))
+  const dir = mkdtempSync(join(tmpdir(), 'companion-pending-'))
   const ctx = makeCtx(dir)
   let release = null
   const gate = new Promise((resolve) => { release = resolve })
@@ -388,7 +421,7 @@ test('自动记忆：fork 子会话的继承前缀不计入触发阈值（回归
    *
    * 这条锁住：阈值只由**本会话自有事件**撑起。
    */
-  const dir = mkdtempSync(join(tmpdir(), 'preset-md-fork-'))
+  const dir = mkdtempSync(join(tmpdir(), 'companion-fork-'))
   const ctx = makeCtx(dir)
   apply(ctx, {})
   writeSettings(resolvePaths(), { autoMemory: true, reviewTurns: 3, reviewChars: 2000 })
@@ -411,7 +444,7 @@ test('自动记忆：fork 子会话的继承前缀不计入触发阈值（回归
 })
 
 test('自动记忆：短对话被跳过（turn_too_short）', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'preset-md-short-'))
+  const dir = mkdtempSync(join(tmpdir(), 'companion-short-'))
   const ctx = makeCtx(dir)
   apply(ctx, {})
   ctx.first('agent/disposed')({ agent: agentWith('hi') })
@@ -421,7 +454,7 @@ test('自动记忆：短对话被跳过（turn_too_short）', async () => {
 })
 
 test('自动记忆：会话只提供 snapshotEvents() 时也能取到转写并落盘（线上回归）', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'preset-md-snapshot-'))
+  const dir = mkdtempSync(join(tmpdir(), 'companion-snapshot-'))
   const ctx = makeCtx(dir)
   apply(ctx, {})
 
@@ -441,7 +474,7 @@ test('自动记忆：会话只提供 snapshotEvents() 时也能取到转写并�
 })
 
 test('自动记忆：转写窗口不因 reviewChars 调小而回缩（阈值与窗口解耦）', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'preset-md-window-'))
+  const dir = mkdtempSync(join(tmpdir(), 'companion-window-'))
   const ctx = makeCtx(dir)
   let seenPrompt = ''
   ctx.llm.stream = (options) => {
@@ -468,7 +501,7 @@ test('自动记忆：转写窗口不因 reviewChars 调小而回缩（阈值与�
 })
 
 test('自动记忆：拿不到任何模型时跳过并 warn', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'preset-md-nomodel-'))
+  const dir = mkdtempSync(join(tmpdir(), 'companion-nomodel-'))
   const ctx = makeCtx(dir)
   ctx.get = () => undefined
   apply(ctx, {})
@@ -479,7 +512,7 @@ test('自动记忆：拿不到任何模型时跳过并 warn', async () => {
 })
 
 test('自动记忆：优先用当前会话正在跑的模型（requestHeader），而不是全局默认', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'preset-md-model-'))
+  const dir = mkdtempSync(join(tmpdir(), 'companion-model-'))
   const ctx = makeCtx(dir)
   let seen = null
   ctx.llm.stream = (options) => {
@@ -510,7 +543,7 @@ test('自动记忆：优先用当前会话正在跑的模型（requestHeader）�
 })
 
 test('参数实时生效：改设置文件后无需重启/新会话即改变触发行为', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'preset-md-live-'))
+  const dir = mkdtempSync(join(tmpdir(), 'companion-live-'))
   const ctx = makeCtx(dir)
   apply(ctx, {})
   const turnStopping = ctx.first('agent/turn-stopping')
@@ -535,7 +568,7 @@ test('参数实时生效：改设置文件后无需重启/新会话即改变触�
 })
 
 test('触发条件满足但执行失败时，把提示注入对话（模型可见）', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'preset-md-notify-'))
+  const dir = mkdtempSync(join(tmpdir(), 'companion-notify-'))
   const ctx = makeCtx(dir)
   ctx.llm.stream = () =>
     (async function* () {
@@ -560,6 +593,20 @@ test('触发条件满足但执行失败时，把提示注入对话（模型可�
   assert.ok(text.includes('执行失败'), '提示需说明是「已触发但失败」')
   assert.ok(text.includes('模拟 provider 故障'), '提示需带上失败原因')
   assert.ok(ctx.logs.warn.join('\n').includes('自动记忆失败'))
+
+  /*
+   * 注入消息也要过官方 V4 准入：dsh 0.1.7-rc.2 起 `MessageSourceMap` 不再有
+   * `plugin` 兜底 kind，`{ kind: 'plugin', plugin: 'dsh-companion' }` 会被
+   * `assertV4RowAdmission` 硬拒并抛 SessionFormatError——这条消息是要落盘的，
+   * 写错等于失败提示永远送不到用户面前。用官方真函数校验，不用自己的判据。
+   */
+  assert.doesNotThrow(
+    () => assertV4RowAdmission(
+      { type: 'user/message', seq: 1, data: injected[0] },
+      new Set(['user/message']),
+    ),
+    `注入消息的 source 必须过官方 V4 准入，实际是 ${JSON.stringify(injected[0].source)}`,
+  )
   rmSync(dir, { recursive: true, force: true })
 })
 
@@ -576,7 +623,7 @@ test('自动记忆：执行失败不推进水位（下一轮重试同一段）',
    * 这里把触发权交给「轮数」，水位一旦被错误推进，后续轮次就再也凑不够阈值。
    * 轮数为 3 时第 3 轮触发；失败后若不推进水位，第 4 轮应再次触发。
    */
-  const dir = mkdtempSync(join(tmpdir(), 'preset-md-nowater-'))
+  const dir = mkdtempSync(join(tmpdir(), 'companion-nowater-'))
   const ctx = makeCtx(dir)
   apply(ctx, {})
   writeSettings(resolvePaths(), { autoMemory: true, reviewTurns: 3, reviewChars: 2000 })
@@ -633,7 +680,7 @@ test('自动记忆：连续失败到上限后放弃这一段，避免水位永�
    * 「失败不推进水位」必须有上限：一段坏内容（模型持续吐非法 JSON 等）会让
    * 水位永久卡死，后面的内容再也轮不到。达到 MAX_REVIEW_ATTEMPTS 后强制推进。
    */
-  const dir = mkdtempSync(join(tmpdir(), 'preset-md-giveup-'))
+  const dir = mkdtempSync(join(tmpdir(), 'companion-giveup-'))
   const ctx = makeCtx(dir)
   apply(ctx, {})
   writeSettings(resolvePaths(), { autoMemory: true, reviewTurns: 1, reviewChars: 1 })
@@ -670,7 +717,7 @@ test('自动记忆：连续失败到上限后放弃这一段，避免水位永�
 })
 
 test('正常跳过（对话太短）不注入对话提示，只在日志留痕', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'preset-md-quiet-'))
+  const dir = mkdtempSync(join(tmpdir(), 'companion-quiet-'))
   const ctx = makeCtx(dir)
   apply(ctx, {})
 
@@ -689,7 +736,7 @@ test('正常跳过（对话太短）不注入对话提示，只在日志留痕',
 })
 
 test('自动记忆：回顾结果落到当天日志文件', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'preset-md-journal-'))
+  const dir = mkdtempSync(join(tmpdir(), 'companion-journal-'))
   const ctx = makeCtx(dir)
   apply(ctx, {})
   ctx.first('agent/disposed')({ agent: agentWith('z'.repeat(200)) })
@@ -697,4 +744,70 @@ test('自动记忆：回顾结果落到当天日志文件', async () => {
   const text = readFileSync(join(dir, 'memory', `${dateKey()}.md`), 'utf8')
   assert.ok(text.includes('聊了插件设计'))
   rmSync(dir, { recursive: true, force: true })
+})
+
+/* ─────────────────── 按会话绑定伙伴（complete 的条件性） ─────────────────── */
+
+/** 造一个"绑定了某伙伴"的会话事件流。 */
+const boundSession = (companion, text = 'z'.repeat(200)) => ({
+  id: 's1',
+  snapshotEvents: () => [
+    { type: 'user/message', data: { content: [{ type: 'text', text }], source: { kind: 'user' } } },
+    { type: 'companion/selected', data: { companion } },
+  ],
+})
+
+test('preset 行插件不再注册提示词 section（注入已移到 host 半按会话注册）', () => {
+  /*
+   * 这是一次**职责搬迁**的守卫。
+   *
+   * 早先 preset 行插件注册一个恒 `complete: true` 的 section，靠"未绑伙伴时
+   * 变量返回空串"当退路 —— 那是错的：官方 `dsh-system-prompt/lib/index.js:345`
+   * 只看 `complete === true` 就记录该段，再在 L359 用它替换掉全部 sections，
+   * 于是空文本的 complete 段会把系统提示词**清成 ""**。
+   *
+   * 现在注入由 host 半在**每个会话自己的 scope** 里按绑定注册（未绑就完全不注册）。
+   * 本插件（preset 行入口）只负责工具收窄与自动记忆。这条断言防的是
+   * "有人又把 section 注册加回来"——那会让所有会话的提示词被顶掉。
+   */
+  const dir = mkdtempSync(join(tmpdir(), 'companion-nosection-'))
+  const ctx = makeCtx(dir)
+  apply(ctx, {})
+
+  assert.deepEqual(
+    ctx.sections.filter((section) => section.complete === true),
+    [],
+    'preset 行插件不该注册 complete section（注入归 host 半）',
+  )
+  assert.equal(ctx.variables.has('companion_persona'), false, 'preset 行插件不该再注册提示词变量')
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('自动记忆：未绑伙伴的会话不写任何目录（防串档）', async () => {
+  /*
+   * 没绑伙伴就没有可写的地方。此时**不能**回落到某个默认目录 ——
+   * 那会把无主会话的对话记进别人的日记里（串档），而且用户看不出来。
+   */
+  const home = mkdtempSync(join(tmpdir(), 'companion-nodir-'))
+  mkdirSync(join(home, 'companion', 'companions'), { recursive: true })
+
+  const previous = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const ctx = makeCtx(undefined)
+    apply(ctx, {})
+    // 无 baseUrl、无绑定 -> 解析不出目录
+    const agent = {
+      id: 'a1',
+      session: { id: 's1', snapshotEvents: () => [{ type: 'user/message', data: { content: [{ type: 'text', text: 'z'.repeat(200) }], source: { kind: 'user' } } }] },
+    }
+    ctx.first('agent/disposed')({ agent })
+    await tick()
+    assert.equal(ctx.stats.streams, 0, '没有目标目录时不该发起回顾')
+    assert.equal(existsSync(join(home, 'companion', 'companions', 'memory')), false, '不该凭空建目录')
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+    rmSync(home, { recursive: true, force: true })
+  }
 })

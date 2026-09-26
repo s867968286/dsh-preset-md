@@ -40,6 +40,15 @@ export const REVIEW_SYSTEM_PROMPT = [
 export const DEFAULT_TRANSCRIPT_CHARS = 8000
 
 /**
+ * 回顾调用里那条 user 消息的 `source.kind`——**生产者自有 kind**。
+ *
+ * dsh 0.1.7-rc.2 起会话格式 v4 不再有 `plugin` 兜底 kind，门禁遇到它会抛
+ * `SessionFormatError: format v4 message requires a producer-owned source kind`。
+ * 取值与迁移器给未知第三方生产者的命名一致（`plugin:<包名>`）。
+ */
+export const REVIEW_SOURCE_KIND = 'plugin:dsh-companion'
+
+/**
  * 判断一条事件是不是**真人**发言。
  *
  * `user/message` 不区分来源：真人发言、官方运行时快照、其他插件的注入消息
@@ -47,9 +56,11 @@ export const DEFAULT_TRANSCRIPT_CHARS = 8000
  * 是**必填**字段，见 `@deepseek-ai/dsh-llm` 的 `Message`）。
  *
  * 必须用**严格匹配** `=== 'user'`，而不是「排除 plugin」：
- * `MessageSourceMap` 是 merge-extensible 的，非真人来源除 `plugin` 外还有
+ * `MessageSourceMap` 是 merge-extensible 的，非真人来源除各族自有 kind 外还有
  * `skill-catalog` / `agent-instructions` / `subagent-settled` / `agent-message`
  * 等多种独立 kind（真实会话里都实测出现过），宽容放行会把它们漏掉。
+ * 该 map 里从 0.1.7-rc.2 起已**不存在** `plugin` 这一项——旧写的第三方注入
+ * 消息在落盘时就被迁移成了 `plugin:<包名>` 之类的自有 kind。
  *
  * 不过滤的后果是**自我喂养**：运行时快照里含记忆条目的标题与描述，被当成
  * 用户发言喂给回顾模型后，模型可能据此再写一条重复记忆。
@@ -259,10 +270,12 @@ export async function callText(ctx, { provider, model, system, prompt, maxTokens
   const message = createUserMessage({
     content: [{ type: 'text', text: prompt }],
     source: {
-      kind: 'plugin',
-      plugin: 'dsh-preset-md',
+      // 生产者自有 kind，不能再用已退役的 `kind: 'plugin'`：dsh 0.1.7-rc.2 的
+      // 会话格式 v4 门禁（assertV4MessageSources）会硬拒绝它并抛 SessionFormatError。
+      // 取值与迁移器给未知第三方生产者的命名一致（`plugin:<包名>`）。
+      kind: REVIEW_SOURCE_KIND,
       form: 'snapshot',
-      sections: [{ name: 'preset-md:review', text: prompt }],
+      sections: [{ name: 'companion:review', text: prompt }],
     },
   })
 

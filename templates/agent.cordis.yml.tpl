@@ -17,9 +17,9 @@
 # 注意：带 `isolate` 的行必须保持 `cordis:group` 结构，不能平铺成顶层行，
 # 否则服务会发布到 root realm，`dsh-agent-presets` 在挂载时直接拒绝。
 
-# ── 提示词注入与自动记忆（自研 preset-md） ──
-- id: preset-md
-  name: dsh-preset-md/preset
+# ── 提示词注入与自动记忆（dsh-companion） ──
+- id: companion
+  name: dsh-companion/preset
   config:
     tools:
       # 收窄全局工具：本插件自带 Markdown 记忆，关掉第三方记忆插件的工具，

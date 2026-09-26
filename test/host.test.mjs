@@ -15,6 +15,8 @@ import {
   generateId,
   listAgents,
   listJournal,
+  listLegacyAgents,
+  migrateAgent,
   nextOrder,
   readAgent,
   readJournal,
@@ -30,7 +32,7 @@ import { DEFAULT_FILES } from '../src/core.js'
 
 /** 建一个临时的 dshHome 并返回 paths。 */
 function makeHome() {
-  const home = mkdtempSync(join(tmpdir(), 'preset-md-home-'))
+  const home = mkdtempSync(join(tmpdir(), 'companion-home-'))
   return { home, paths: resolvePaths(home) }
 }
 
@@ -39,8 +41,9 @@ test('resolvePaths：显式 home 优先，DSH_HOME 次之', () => {
   process.env.DSH_HOME = 'C:/fake-dsh-home'
   const paths = resolvePaths()
   assert.equal(paths.dshHome, 'C:/fake-dsh-home')
-  assert.equal(paths.presetsRoot, join('C:/fake-dsh-home', '.agent-presets'))
-  assert.equal(paths.backupRoot, join('C:/fake-dsh-home', '.agent-presets-backup'))
+  assert.equal(paths.companionsRoot, join('C:/fake-dsh-home', 'companion', 'companions'))
+  assert.equal(paths.backupRoot, join('C:/fake-dsh-home', 'companion', 'companions-backup'))
+  assert.equal(paths.legacyPresetsRoot, join('C:/fake-dsh-home', '.agent-presets'))
   if (previous === undefined) delete process.env.DSH_HOME
   else process.env.DSH_HOME = previous
   assert.equal(resolvePaths('D:/explicit').dshHome, 'D:/explicit')
@@ -48,7 +51,7 @@ test('resolvePaths：显式 home 优先，DSH_HOME 次之', () => {
 
 test('preset.yml 往返：写入 name/description/order，读回一致', () => {
   const { home, paths } = makeHome()
-  const dir = join(paths.presetsRoot, 'demo')
+  const dir = join(paths.companionsRoot, 'demo')
   mkdirSync(dir, { recursive: true })
   writePresetMeta(dir, { name: '小花', description: '温柔但直接', order: 3 })
   const meta = readPresetMeta(dir)
@@ -58,7 +61,7 @@ test('preset.yml 往返：写入 name/description/order，读回一致', () => {
 
 test('preset.yml：缺失 order 读成 undefined，不是 0', () => {
   const { home, paths } = makeHome()
-  const dir = join(paths.presetsRoot, 'demo')
+  const dir = join(paths.companionsRoot, 'demo')
   mkdirSync(dir, { recursive: true })
   writeFileSync(join(dir, 'preset.yml'), 'name: 小花\ndescription: 无 order\n', 'utf8')
   const meta = readPresetMeta(dir)
@@ -66,7 +69,7 @@ test('preset.yml：缺失 order 读成 undefined，不是 0', () => {
   assert.equal(meta.name, '小花')
 
   // 文件完全不存在时同样是 undefined
-  const empty = join(paths.presetsRoot, 'empty')
+  const empty = join(paths.companionsRoot, 'empty')
   mkdirSync(empty, { recursive: true })
   assert.equal(readPresetMeta(empty).order, undefined)
   rmSync(home, { recursive: true, force: true })
@@ -75,7 +78,7 @@ test('preset.yml：缺失 order 读成 undefined，不是 0', () => {
 test('preset.yml：无 order 的伙伴排序不应被当成 0 插到最前', () => {
   const { home, paths } = makeHome()
   const withOrder = createAgent(paths, { name: '有序号' })       // order 0
-  const dir = join(paths.presetsRoot, 'no-order')
+  const dir = join(paths.companionsRoot, 'no-order')
   mkdirSync(dir, { recursive: true })
   writePresetMeta(dir, { name: '无序号', order: undefined })      // 写入 order: 0 是刻意的（写全字段）
   writeFileSync(join(dir, 'preset.yml'), 'name: 无序号\n', 'utf8') // 再抹掉 order 模拟外部创建
@@ -89,7 +92,7 @@ test('preset.yml：无 order 的伙伴排序不应被当成 0 插到最前', () 
 
 test('preset.yml：值含冒号/引号/反斜杠/换行都能原样往返', () => {
   const { home, paths } = makeHome()
-  const dir = join(paths.presetsRoot, 'demo')
+  const dir = join(paths.companionsRoot, 'demo')
   mkdirSync(dir, { recursive: true })
   const cases = [
     '莉莉: 副手',
@@ -119,7 +122,7 @@ test('preset.yml：值含冒号/引号/反斜杠/换行都能原样往返', () =
 
 test('preset.yml：有值的字段照常写，order 0 也保留', () => {
   const { home, paths } = makeHome()
-  const dir = join(paths.presetsRoot, 'demo')
+  const dir = join(paths.companionsRoot, 'demo')
   mkdirSync(dir, { recursive: true })
   writePresetMeta(dir, { name: 'x', description: '', order: 0 })
   const text = readFileSync(join(dir, 'preset.yml'), 'utf8')
@@ -137,7 +140,7 @@ test('preset.yml：有值的字段照常写，order 0 也保留', () => {
 
 test('preset.yml：只替换三个已知键，注释与其余字段原样保留', () => {
   const { home, paths } = makeHome()
-  const dir = join(paths.presetsRoot, 'demo')
+  const dir = join(paths.companionsRoot, 'demo')
   mkdirSync(dir, { recursive: true })
   /*
    * preset.yml 归官方 dsh-agent-presets 管理，用户可以在里面放官方当前不读的键
@@ -168,7 +171,7 @@ test('preset.yml：只替换三个已知键，注释与其余字段原样保留'
 
 test('preset.yml：会被 YAML 隐式类型化的值强制加引号', () => {
   const { home, paths } = makeHome()
-  const dir = join(paths.presetsRoot, 'demo')
+  const dir = join(paths.companionsRoot, 'demo')
   mkdirSync(dir, { recursive: true })
   /*
    * 官方用 js-yaml 读这个文件，未加引号的 123 / true / null / 2026-09-13
@@ -190,7 +193,7 @@ test('preset.yml：会被 YAML 隐式类型化的值强制加引号', () => {
 
 test('preset.yml：缺 order 的伙伴改名后不该被写成 order: 0', () => {
   const { home, paths } = makeHome()
-  const dir = join(paths.presetsRoot, 'manual')
+  const dir = join(paths.companionsRoot, 'manual')
   mkdirSync(dir, { recursive: true })
   writeFileSync(join(dir, 'preset.yml'), 'name: 手工\n', 'utf8')
 
@@ -209,7 +212,7 @@ test('preset.yml：缺 order 的伙伴改名后不该被写成 order: 0', () => 
 
 test('preset.yml：CRLF 文件改写后仍是 CRLF', () => {
   const { home, paths } = makeHome()
-  const dir = join(paths.presetsRoot, 'crlf')
+  const dir = join(paths.companionsRoot, 'crlf')
   mkdirSync(dir, { recursive: true })
   writeFileSync(join(dir, 'preset.yml'), 'name: 甲\r\norder: 1\r\n', 'utf8')
   writePresetMeta(dir, { name: '乙', order: 1 })
@@ -224,37 +227,37 @@ test('nextOrder：跳过缺 order 的伙伴，不产生巨大序号', () => {
   const { home, paths } = makeHome()
   const a = createAgent(paths, { name: 'A' })   // order 0
   const b = createAgent(paths, { name: 'B' })   // order 1
-  const orphan = join(paths.presetsRoot, 'orphan')
+  const orphan = join(paths.companionsRoot, 'orphan')
   mkdirSync(orphan, { recursive: true })
   writeFileSync(join(orphan, 'preset.yml'), 'name: 外部创建\n', 'utf8') // 无 order
 
   assert.equal(nextOrder(paths), 2, '不能被无 order 的伙伴顶成 MAX_SAFE_INTEGER 级别')
   const c = createAgent(paths, { name: 'C' })
-  assert.equal(readPresetMeta(join(paths.presetsRoot, c.id)).order, 2)
+  assert.equal(readPresetMeta(join(paths.companionsRoot, c.id)).order, 2)
   rmSync(home, { recursive: true, force: true })
 })
 
-test('generateId：ASCII 名转 slug，中文名回落 presetmd-', () => {
+test('generateId：ASCII 名转 slug，中文名回落 companion-', () => {
   assert.match(generateId('Little Cat', new Set()), /^little-cat-[0-9a-f]{4}$/)
-  assert.match(generateId('小花', new Set()), /^presetmd-[0-9a-f]{4}$/)
+  assert.match(generateId('小花', new Set()), /^companion-[0-9a-f]{4}$/)
   const existing = new Set()
   const first = generateId('a', existing)
   existing.add(first)
   assert.notEqual(generateId('a', existing), first)
 })
 
-test('createAgent：生成 6 个 MD + agent.cordis.yml + preset.yml + memory 目录', () => {
+test('createAgent：生成 6 个 MD + preset.yml + memory 目录', () => {
   const { home, paths } = makeHome()
   const agent = createAgent(paths, { name: '小花', description: '温柔但直接' })
   assert.equal(agent.name, '小花')
   assert.equal(agent.description, '温柔但直接')
   for (const { file } of PRESET_FILES) {
     assert.equal(typeof agent.files[file], 'string', `${file} 应有内容`)
-    assert.ok(existsSync(join(paths.presetsRoot, agent.id, file)), `${file} 应落盘`)
+    assert.ok(existsSync(join(paths.companionsRoot, agent.id, file)), `${file} 应落盘`)
   }
-  assert.ok(existsSync(join(paths.presetsRoot, agent.id, 'memory')))
-  const cordis = readFileSync(join(paths.presetsRoot, agent.id, 'agent.cordis.yml'), 'utf8')
-  assert.ok(cordis.includes('name: dsh-preset-md/preset'))
+  assert.ok(existsSync(join(paths.companionsRoot, agent.id, 'memory')))
+  assert.ok(existsSync(join(paths.companionsRoot, agent.id, 'preset.yml')))
+
   assert.ok(agent.files['IDENTITY.md'].includes('小花'))
   rmSync(home, { recursive: true, force: true })
 })
@@ -294,7 +297,7 @@ test('renderAllTemplates / agentCordisTemplate：模板都能渲染，不留占�
    * 所以这里断言它被完整读出、且同样不含残留占位符。
    */
   const cordis = agentCordisTemplate('测试')
-  assert.ok(cordis.includes('- id: preset-md'), 'cordis 模板应含 preset-md 行')
+  assert.ok(cordis.includes('- id: companion'), 'cordis 模板应含 companion 行')
   assert.ok(!cordis.includes('{name}'), 'cordis 模板不应残留 {name}')
   assert.ok(!cordis.includes('{user}'), 'cordis 模板不应残留 {user}')
 })
@@ -312,7 +315,7 @@ test('agent.cordis.yml 模板是人格类预设：不含编码 agent 的重型�
   const ids = [...text.matchAll(/^- id:[ \t]*(\S+)/gm)].map((m) => m[1])
 
   // 基础工具必须在
-  for (const id of ['preset-md', 'tool-bash', 'tool-pwsh', 'tool-fs', 'tool-fs-search', 'tool-skill', 'tool-ask-user', 'tool-todo', 'tool-web']) {
+  for (const id of ['companion', 'tool-bash', 'tool-pwsh', 'tool-fs', 'tool-fs-search', 'tool-skill', 'tool-ask-user', 'tool-todo', 'tool-web']) {
     assert.ok(ids.includes(id), `人格类预设应保留基础工具 ${id}`)
   }
 
@@ -324,8 +327,8 @@ test('agent.cordis.yml 模板是人格类预设：不含编码 agent 的重型�
   // 不挂 persona：官方 persona 的 "You are a coding agent ..." 会盖掉人格
   assert.ok(!ids.includes('persona'), '人格由 SYSTEM.md / IDENTITY.md 承载，不挂官方 persona 行')
 
-  // preset-md 行要带工具收窄配置（关掉第三方记忆插件的工具）
-  assert.match(text, /- id: preset-md[\s\S]{0,200}deny:/, 'preset-md 行应带 tools.deny 收窄')
+  // companion 行要带工具收窄配置（关掉第三方记忆插件的工具）
+  assert.match(text, /- id: companion[\s\S]{0,200}deny:/, 'companion 行应带 tools.deny 收窄')
   assert.match(text, /'mnemon\*'/, '应关掉 mnemon 的工具，避免两套记忆系统打架')
 })
 
@@ -354,7 +357,7 @@ test('archiveAgent：移动到备份目录，原目录消失、备份保留内�
   const result = archiveAgent(paths, agent.id, new Date(2026, 8, 9, 10, 30, 5))
   assert.ok(result.archived.startsWith(paths.backupRoot))
   assert.ok(result.archived.endsWith(`${agent.id}-20260909-103005`))
-  assert.ok(!existsSync(join(paths.presetsRoot, agent.id)))
+  assert.ok(!existsSync(join(paths.companionsRoot, agent.id)))
   assert.ok(existsSync(join(result.archived, 'SOUL.md')))
   assert.deepEqual(listAgents(paths), [])
   rmSync(home, { recursive: true, force: true })
@@ -366,7 +369,7 @@ test('copyAgent：克隆伙伴内容、替换名字、不带历史日记、order
   // 制造差异内容与日记，验证「复制内容、不复制日记」
   await writeAgentFile(paths, source.id, 'SOUL.md', '# 个性\n\n你是莉莉的专属灵魂，话少直接。\n')
   await writeAgentFile(paths, source.id, 'IDENTITY.md', '# 身份\n\n你是 莉莉，鹏哥 的个人助手。\n')
-  const dir = join(paths.presetsRoot, source.id, 'memory')
+  const dir = join(paths.companionsRoot, source.id, 'memory')
   writeFileSync(join(dir, '2026-09-08.md'), '私密日记', 'utf8')
 
   const copy = copyAgent(paths, source.id, { name: '莉莉二号' })
@@ -378,7 +381,7 @@ test('copyAgent：克隆伙伴内容、替换名字、不带历史日记、order
   assert.ok(!copy.files['IDENTITY.md'].includes('你是 莉莉，'), '不应残留源名字')
 
   // 不带历史日记（新建的 memory 目录为空）
-  assert.ok(existsSync(join(paths.presetsRoot, copy.id, 'memory')))
+  assert.ok(existsSync(join(paths.companionsRoot, copy.id, 'memory')))
   assert.deepEqual(listJournal(paths, copy.id), [])
 
   // order 排在源之后
@@ -400,7 +403,7 @@ test('copyAgent：空昵称回落「xxx 的副本」、源不存在拒绝', () =
 test('listJournal / readJournal：按日期倒序，非法日期拒绝', () => {
   const { home, paths } = makeHome()
   const agent = createAgent(paths, { name: 'Z' })
-  const dir = join(paths.presetsRoot, agent.id, 'memory')
+  const dir = join(paths.companionsRoot, agent.id, 'memory')
   writeFileSync(join(dir, '2026-09-08.md'), '# 2026-09-08\n\n## 09:00\n\n聊了 A\n', 'utf8')
   writeFileSync(join(dir, '2026-09-09.md'), '# 2026-09-09\n\n## 10:00\n\n聊了 B\n', 'utf8')
   writeFileSync(join(dir, 'notes.md'), '忽略我', 'utf8')
@@ -422,14 +425,21 @@ test('listJournal / readJournal：非法 id 也拒绝（防路径穿越）', () 
   rmSync(home, { recursive: true, force: true })
 })
 
-test('createAgent：新建的伙伴带 preset-md 注入行', () => {
-  // 这条原来通过已删除的 usesPresetMd() 断言，改成直接读文件——
-  // 「新建伙伴要能直接生效」这个行为本身仍值得锁住。
+test('createAgent：新建伙伴立刻可被 listAgents 看到（无需重启/装包）', () => {
+  /*
+   * 这条锁的是本轮的架构取舍：伙伴不再是"官方预设"，所以新建**不需要**
+   * 装 bundle、不需要重启 dsh —— 写完文件立刻出现在伙伴列表里。
+   *
+   * 反面：旧做法要生成 bundle 声明并走安装流程，新建一个伙伴 = 跑 pnpm + 重启。
+   * 现在换了落点，这条断言就是那个取舍的守卫。
+   */
   const { home, paths } = makeHome()
-  const agent = createAgent(paths, { name: 'W' })
-  const text = readFileSync(join(paths.presetsRoot, agent.id, 'agent.cordis.yml'), 'utf8')
-  assert.match(text, /^[ \t]*-[ \t]*id:[ \t]*preset-md[ \t]*$/m, '新建的伙伴应带 preset 行')
-  assert.match(text, /name:[ \t]*dsh-preset-md\/preset/, '行名要指向 preset 子路径入口')
+  const agent = createAgent(paths, { name: 'W', description: '即插即用' })
+  const listed = listAgents(paths)
+  assert.equal(listed.length, 1, '新建后应立刻出现在列表里')
+  assert.equal(listed[0].id, agent.id)
+  assert.equal(listed[0].name, 'W')
+  assert.equal(listed[0].description, '即插即用')
   rmSync(home, { recursive: true, force: true })
 })
 
@@ -549,5 +559,83 @@ test('readAgent：非法 id / 不存在的 id 报错', () => {
   const { home, paths } = makeHome()
   assert.throws(() => readAgent(paths, '../x'), /非法 id/)
   assert.throws(() => readAgent(paths, 'nope'), /伙伴不存在/)
+  rmSync(home, { recursive: true, force: true })
+})
+
+/* ─────────────────── 伙伴数据搬迁（.agent-presets → companion/companions） ─────────────────── */
+
+test('migrateAgent：把旧位置的伙伴整体搬到新位置，内容一字不动', () => {
+  /*
+   * 为什么必须搬：rc2 起官方完全不再读 `.agent-presets/`，把伙伴留在那里
+   * 会让人误以为"它是官方预设"，实际官方根本不看。搬走后该目录是纯粹的本插件数据。
+   * 本用例断言"只移动、不改内容"——人格与日记一个字都不能变。
+   */
+  const { home, paths } = makeHome()
+  const id = 'legacy-1'
+  const from = join(paths.legacyPresetsRoot, id)
+  mkdirSync(join(from, 'memory'), { recursive: true })
+  writeFileSync(join(from, 'preset.yml'), 'name: 旧伙伴\ndescription: 迁移测试\norder: 7\n', 'utf8')
+  writeFileSync(join(from, 'SOUL.md'), '# 灵魂\n这是人格，迁移不该动它。\n', 'utf8')
+  writeFileSync(join(from, 'memory', '2026-09-01.md'), '# 9 月 1 日\n旧日记内容\n', 'utf8')
+
+  assert.deepEqual(listLegacyAgents(paths), [id], '应识别出旧位置的伙伴')
+
+  const result = migrateAgent(paths, id)
+  assert.equal(result.migrated, true)
+
+  const to = join(paths.companionsRoot, id)
+  assert.ok(existsSync(to), '应搬到新位置')
+  assert.ok(!existsSync(from), '旧位置应已清空')
+
+  // 内容一字不动：人格、元数据、日记
+  assert.equal(readFileSync(join(to, 'SOUL.md'), 'utf8'), '# 灵魂\n这是人格，迁移不该动它。\n')
+  assert.equal(readFileSync(join(to, 'memory', '2026-09-01.md'), 'utf8'), '# 9 月 1 日\n旧日记内容\n')
+  assert.equal(readPresetMeta(to).name, '旧伙伴')
+  assert.equal(readPresetMeta(to).order, 7)
+
+  // 搬完后不再被列为待迁移；新位置能被正常读出
+  assert.deepEqual(listLegacyAgents(paths), [])
+  assert.equal(readAgent(paths, id).name, '旧伙伴')
+
+  // 幂等：再迁一次只会说明"新位置已存在"
+  assert.equal(migrateAgent(paths, id).migrated, false)
+  rmSync(home, { recursive: true, force: true })
+})
+
+test('listLegacyAgents：只认真正的伙伴目录，不误报无关目录', () => {
+  /*
+   * 判据是"目录里有 preset.yml 或六个 MD 之一"——只看目录名会把用户在
+   * `.agent-presets/` 下随手建的无关目录（缓存、临时目录）也算成待迁移伙伴。
+   */
+  const { home, paths } = makeHome()
+  mkdirSync(join(paths.legacyPresetsRoot, 'real-one'), { recursive: true })
+  writeFileSync(join(paths.legacyPresetsRoot, 'real-one', 'preset.yml'), 'name: 真家伙\n', 'utf8')
+  mkdirSync(join(paths.legacyPresetsRoot, 'not-a-partner'), { recursive: true })
+  writeFileSync(join(paths.legacyPresetsRoot, 'not-a-partner', 'cache.bin'), 'x', 'utf8')
+  mkdirSync(join(paths.legacyPresetsRoot, 'Bad_Id'), { recursive: true })
+  writeFileSync(join(paths.legacyPresetsRoot, 'Bad_Id', 'preset.yml'), 'name: 非法id\n', 'utf8')
+
+  assert.deepEqual(listLegacyAgents(paths), ['real-one'])
+  rmSync(home, { recursive: true, force: true })
+})
+
+test('createAgent / copyAgent：不再产出 bundle 声明（伙伴是插件自己的数据）', () => {
+  /*
+   * 这是本轮架构调整的核心：伙伴不再是"官方预设"，所以不该再生成
+   * cordis.patch.yml / package.json —— 那两样东西只对 bundle 有意义，
+   * 留着会让人以为"要装包才能用"，与"新建即用、无需重启"直接矛盾。
+   */
+  const { home, paths } = makeHome()
+  const agent = createAgent(paths, { name: '无声明', description: '签名' })
+  const dir = join(paths.companionsRoot, agent.id)
+  assert.ok(!existsSync(join(dir, 'cordis.patch.yml')), '不该再有 bundle patch')
+  assert.ok(!existsSync(join(dir, 'package.json')), '不该再有 bundle package.json')
+  assert.ok(existsSync(join(dir, 'preset.yml')), 'preset.yml 仍要写（昵称/签名/排序）')
+
+  const copy = copyAgent(paths, agent.id, { name: '副本' })
+  const copyDir = join(paths.companionsRoot, copy.id)
+  assert.ok(!existsSync(join(copyDir, 'cordis.patch.yml')))
+  assert.ok(existsSync(join(copyDir, 'SOUL.md')), '副本仍应带六个 MD')
+  assert.equal(readAgent(paths, copy.id).name, '副本')
   rmSync(home, { recursive: true, force: true })
 })

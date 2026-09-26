@@ -1,11 +1,11 @@
-# dsh bundle patch：把「伙伴设置」的 Host 半插入 profile。
+# dsh bundle patch：把「伙伴」的 Host 半插入 profile。
 #
 # 必须挂在 host 平面：preset 行插件无法注册 web 路由，
-# 而设置页需要读写 `<dshHome>/.agent-presets/` 下的文件。
+# 而设置页/伙伴绑定需要读写 `<dshHome>/companion/` 下的文件与路由。
 #
 # name 必须是**包名**（不能带子路径）：dsh 的前端模块系统
 # （dsh-client-modules）按插件行的 name 定位包并读取它的 dsh.client / exports["./client"]，
 # 带子路径会被解析成"找不到包"而静默跳过，client bundle 就进不了 __DSH_BOOT__。
 - insert:
-    - id: dsh-preset-md
-      name: dsh-preset-md
+    - id: dsh-companion
+      name: dsh-companion

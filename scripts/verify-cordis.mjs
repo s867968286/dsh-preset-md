@@ -7,7 +7,7 @@
  *   换机器 / 换 node 版本都不用改脚本。
  * - 默认只校验 `templates/agent.cordis.yml.tpl`（结果确定，可进 CI）。
  * - 想额外校验某个本机预设，把路径作为命令行参数传入：
- *     node scripts/verify-cordis.mjs ~/.dsh/.agent-presets/presetmd-e4d0/agent.cordis.yml
+ *     node scripts/verify-cordis.mjs ~/.dsh/.agent-presets/companion-e4d0/agent.cordis.yml
  *   **不自动探测**：本机可能同时存在多个预设（含实验性的），随便挑一个会产生
  *   误导性的「缺少官方行」报错。
  */
@@ -67,8 +67,28 @@ try {
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
+/*
+ * 官方 standard 预设的位置随 dsh 版本变过，两个都试：
+ *  - 0.1.7-rc.2 起：`dsh-web-app/presets/standard.patch.yml`，行清单嵌在该 patch
+ *    insert 的那条 `@deepseek-ai/dsh-agent-preset` 的 `config.plugins` 里
+ *    （见 dsh-web-app/package.json 的 `dsh.bundle.patch` 列表）。
+ *  - 更早：`dsh-agent-presets/presets/standard/agent.cordis.yml`，顶层就是行清单。
+ * 找不到就报错退出，而不是静默比较空清单——那会把「官方行全对不上」伪装成通过。
+ */
+const STANDARD_FILE = [
+  join(NM, 'dsh-web-app', 'presets', 'standard.patch.yml'),
+  join(NM, 'dsh-agent-presets', 'presets', 'standard', 'agent.cordis.yml'),
+].find((file) => existsSync(file))
+if (!STANDARD_FILE) {
+  console.error(
+    '[ERROR] 找不到官方 standard 预设（dsh-web-app/presets/standard.patch.yml 与 '
+    + 'dsh-agent-presets/presets/standard/agent.cordis.yml 都不存在），无法比对行清单',
+  )
+  process.exit(1)
+}
+
 const FILES = {
-  standard: join(NM, 'dsh-agent-presets', 'presets', 'standard', 'agent.cordis.yml'),
+  standard: STANDARD_FILE,
   tpl: join(REPO_ROOT, 'templates', 'agent.cordis.yml.tpl'),
 }
 // 可选：命令行指定要一并校验的本机预设（不自动探测，见文件头说明）
@@ -92,6 +112,26 @@ function collectRows(docs, out = [], inGroup = false) {
   return out
 }
 
+/**
+ * 取出「预设声明的行清单」。
+ *
+ * 两种官方形态：
+ *  - 老版：`agent.cordis.yml` 顶层就是行清单，直接用。
+ *  - 0.1.7-rc.2：`presets/standard.patch.yml` 顶层是 patch 行，真正的预设行
+ *    嵌在 `insert` 里那条 `@deepseek-ai/dsh-agent-preset` 的 `config.plugins`。
+ *    用 `insert` 里的 id 找（`preset-standard`），不硬编码顺序。
+ */
+function presetRowsOf(docs) {
+  for (const row of docs ?? []) {
+    for (const candidate of row?.insert ?? []) {
+      if (candidate?.name === '@deepseek-ai/dsh-agent-preset' && Array.isArray(candidate.config?.plugins)) {
+        return candidate.config.plugins
+      }
+    }
+  }
+  return docs
+}
+
 /** 递归收集 group 的 isolate 声明，并检查 isolate 是否都带 cordis:group。 */
 function collectGroups(docs, out = []) {
   for (const row of docs ?? []) {
@@ -112,7 +152,8 @@ for (const [key, file] of Object.entries(FILES)) {
   const docs = YAML.parseAllDocuments(text, { prettyErrors: true })
   const errors = docs.flatMap((d) => d.errors ?? [])
   const merged = docs.flatMap((d) => d.toJS() ?? [])
-  parsed[key] = { rows: collectRows(merged), groups: collectGroups(merged), errors }
+  const rows = presetRowsOf(merged)
+  parsed[key] = { rows: collectRows(rows), groups: collectGroups(rows), errors }
 }
 
 let fail = 0
@@ -179,7 +220,7 @@ for (const key of ['preset', 'tpl'].filter((k) => parsed[k])) {
 
   // 模板里出现的官方行，name/config 应与官方一致
   for (const row of rows) {
-    if (row.id === 'preset-md' || row.id === 'mnemon') continue
+    if (row.id === 'companion' || row.id === 'mnemon') continue
     const s = stdMap.get(row.id)
     if (!s) {
       say('WARN', `${key}/${row.id} 在官方 standard 里没有同名行（自研或拼错？）`)

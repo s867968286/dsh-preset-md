@@ -1,5 +1,5 @@
 /**
- * dsh-preset-md 核心逻辑单测（零依赖，node --test）。
+ * dsh-companion 核心逻辑单测（零依赖，node --test）。
  * 不需要 dsh 进程：用假 ctx 驱动 registerPrompt。
  */
 import { test } from 'node:test'
@@ -13,8 +13,8 @@ import {
   DEFAULT_FILES,
   FILE_WEIGHTS,
   PLACEHOLDERS,
-  PROMPT_SECTION,
-  PROMPT_VARIABLE,
+  COMPANION_PERSONA_SECTION,
+  COMPANION_PERSONA_VARIABLE,
   applyToolRestriction,
   contextBudgetNotice,
   contextFacts,
@@ -37,7 +37,7 @@ import {
 
 /** 建一个临时预设目录。 */
 function makePresetDir(files = {}) {
-  const dir = mkdtempSync(join(tmpdir(), 'preset-md-'))
+  const dir = mkdtempSync(join(tmpdir(), 'companion-'))
   for (const [name, body] of Object.entries(files)) writeFileSync(join(dir, name), body, 'utf8')
   return dir
 }
@@ -184,11 +184,11 @@ test('registerPrompt：section 只注册一次（complete 固定为 true，不�
   const dir = makePresetDir({ 'SOUL.md': 'x' })
   const ctx = makeCtx(pathToFileURL(dir).href)
   registerPrompt(ctx, { getSettings: () => ({ budgetNotice: false }) })
-  const read = ctx.variables.get(PROMPT_VARIABLE)
+  const read = ctx.variables.get(COMPANION_PERSONA_VARIABLE)
 
   assert.equal(ctx.sections.length, 1)
   assert.equal(ctx.sections[0].complete, true, '必须始终独占（否则官方提示词会与我们的 MD 并存）')
-  assert.equal(ctx.sections[0].text, `{{${PROMPT_VARIABLE}}}`, '文本只引用变量')
+  assert.equal(ctx.sections[0].text, `{{${COMPANION_PERSONA_VARIABLE}}}`, '文本只引用变量')
 
   // 多次渲染不应重复注册，也不应丢掉 complete
   read(asSession('s1'))
@@ -204,7 +204,7 @@ test('registerPrompt：budgetNotice 实时开关（关掉后不再注入收敛�
   const ctx = makeCtx(pathToFileURL(dir).href)
   let budgetNotice = true
   registerPrompt(ctx, { getSettings: () => ({ budgetNotice, contextBudget: 1000 }) })
-  const read = ctx.variables.get(PROMPT_VARIABLE)
+  const read = ctx.variables.get(COMPANION_PERSONA_VARIABLE)
 
   // 注意：正文按会话冻结，所以用不同会话 id 取「当前设置下」的渲染结果
   assert.ok(read(asSession('s1')).includes('上下文预算提醒'))
@@ -261,11 +261,12 @@ test('contextFacts / substitutePlaceholders：presetDir 独立于 preset', () =>
 test('registerPrompt：变量承载内容 + 唯一 complete section', () => {
   const dir = makePresetDir({ 'SOUL.md': '人格文本', 'MEMORY.md': '记忆文本' })
   const ctx = makeCtx(pathToFileURL(dir).href)
-  const result = registerPrompt(ctx)
+  // 显式给定伙伴目录：真实环境由 host 半在会话 scope 里定下来。
+  const result = registerPrompt(ctx, { dir })
 
+  assert.deepEqual(ctx.sections, [{ name: COMPANION_PERSONA_SECTION, order: 0, text: `{{${COMPANION_PERSONA_VARIABLE}}}`, complete: true }])
+  assert.equal(ctx.variables.get(COMPANION_PERSONA_VARIABLE)(asSession('s1')), '人格文本\n\n记忆文本')
   assert.equal(result.dir, dir)
-  assert.deepEqual(ctx.sections, [{ name: PROMPT_SECTION, order: 0, text: `{{${PROMPT_VARIABLE}}}`, complete: true }])
-  assert.equal(ctx.variables.get(PROMPT_VARIABLE)(asSession('s1')), '人格文本\n\n记忆文本')
   rmSync(dir, { recursive: true, force: true })
 })
 
@@ -305,7 +306,7 @@ test('端到端：MD 正文里的花括号不会被官方插值解析（走真�
     const section = ctx.sections[0]
     const rendered = renderPrompt({
       sections: [{ name: section.name, order: section.order, text: section.text }],
-      variables: { [PROMPT_VARIABLE]: ctx.variables.get(PROMPT_VARIABLE)(asSession('s1')) },
+      variables: { [COMPANION_PERSONA_VARIABLE]: ctx.variables.get(COMPANION_PERSONA_VARIABLE)(asSession('s1')) },
       contexts: [],
       tools: [],
     })
@@ -357,7 +358,7 @@ test('registerPrompt：会话内冻结（同一会话读盘一次，新会话重
   const dir = makePresetDir({ 'SOUL.md': '第一版' })
   const ctx = makeCtx(pathToFileURL(dir).href)
   registerPrompt(ctx)
-  const read = ctx.variables.get(PROMPT_VARIABLE)
+  const read = ctx.variables.get(COMPANION_PERSONA_VARIABLE)
   assert.equal(read(asSession('s1')), '第一版')
   writeFileSync(join(dir, 'SOUL.md'), '第二版', 'utf8')
   assert.equal(read(asSession('s1')), '第一版', '同一会话内必须冻结')
@@ -366,7 +367,7 @@ test('registerPrompt：会话内冻结（同一会话读盘一次，新会话重
   // 明确移除的能力：不再有「关掉冻结、每步重读」这条路径
   const liveCtx = makeCtx(pathToFileURL(dir).href)
   registerPrompt(liveCtx, { freeze: false })   // 未知选项应被静默忽略
-  const live = liveCtx.variables.get(PROMPT_VARIABLE)
+  const live = liveCtx.variables.get(COMPANION_PERSONA_VARIABLE)
   assert.equal(live(asSession('s1')), '第二版')
   writeFileSync(join(dir, 'SOUL.md'), '第三版', 'utf8')
   assert.equal(live(asSession('s1')), '第二版', 'freeze 选项已移除，传入也不该每步重读')
@@ -386,7 +387,7 @@ test('registerPrompt：缓存命中后不再读盘（每步返回同一份，且
   const dir = makePresetDir({ 'SOUL.md': '原始内容' })
   const ctx = makeCtx(pathToFileURL(dir).href)
   registerPrompt(ctx)
-  const read = ctx.variables.get(PROMPT_VARIABLE)
+  const read = ctx.variables.get(COMPANION_PERSONA_VARIABLE)
   const session = asSession('s1')
 
   assert.equal(read(session), '原始内容', '首次读盘')
@@ -415,7 +416,7 @@ test('registerPrompt：注入预算与超限提醒同样按会话冻结（新会
   const ctx = makeCtx(pathToFileURL(dir).href)
   let budgetNotice = true
   registerPrompt(ctx, { getSettings: () => ({ budgetNotice, contextBudget: 1000 }) })
-  const read = ctx.variables.get(PROMPT_VARIABLE)
+  const read = ctx.variables.get(COMPANION_PERSONA_VARIABLE)
   const s1 = asSession('s1')
 
   assert.ok(read(s1).includes('上下文预算提醒'), '初始应注入提醒')
@@ -425,27 +426,46 @@ test('registerPrompt：注入预算与超限提醒同样按会话冻结（新会
   rmSync(dir, { recursive: true, force: true })
 })
 
-test('registerPrompt：占位符按会话替换并参与冻结；目录未知返回空串', () => {
+test('registerPrompt：占位符按会话替换并参与冻结；未绑伙伴返回空串', () => {
   const dir = makePresetDir({ 'SYSTEM.md': 'cwd={{cwd}}' })
   const ctx = makeCtx(pathToFileURL(dir).href)
-  registerPrompt(ctx, {})
-  const read = ctx.variables.get(PROMPT_VARIABLE)
+  registerPrompt(ctx, { dir })
+  const read = ctx.variables.get(COMPANION_PERSONA_VARIABLE)
   const session = (cwd) => ({ agent: { session: { id: 's1', header: { cwd } } } })
   assert.equal(read(session('D:/ws')), 'cwd=D:/ws')
   assert.equal(read(session('D:/other')), 'cwd=D:/ws')
-
-  const emptyCtx = makeCtx(undefined)
-  const empty = registerPrompt(emptyCtx, {})
-  assert.equal(empty.dir, '')
-  assert.equal(emptyCtx.variables.get(PROMPT_VARIABLE)(asSession('s1')), '')
   rmSync(dir, { recursive: true, force: true })
+})
+
+test('registerPrompt：没有目录时不注册任何 section —— 官方提示词原样生效', () => {
+  /*
+   * 这条锁的是本插件的**退路契约**：会话没选伙伴 -> **一个 section 都不注册**。
+   *
+   * ⚠️ 关键区分（曾经做错过）：退路**不是**"注册一个文本为空的 complete 段"。
+   * 官方 `dsh-system-prompt/lib/index.js:345` 只看 `complete === true` 就记录该段，
+   * 然后在 L359 用它**替换掉全部 sections** —— 空文本的 complete 段会把系统
+   * 提示词清成 `""`，比不注册糟糕得多。
+   *
+   * 所以正确的做法是"未绑伙伴时调用方根本不调 registerPrompt"。本用例断言：
+   * 即使传了空目录，也不该产生一个 complete 段去顶掉官方提示词。
+   */
+  const ctx = makeCtx(undefined)
+  const result = registerPrompt(ctx, { dir: '' })
+
+  assert.equal(result.dir, '', '空目录应原样透出，供调用方判断')
+  assert.deepEqual(
+    ctx.sections.filter((section) => section.complete === true),
+    [],
+    '没有伙伴目录时不得注册 complete 段（否则会清空官方提示词）',
+  )
+  rmSync(ctx.tmpDir ?? '', { recursive: true, force: true })
 })
 
 test('registerPrompt：{{presetDir}} 注入为预设目录绝对路径，与 {{cwd}} 相互独立', () => {
   const dir = makePresetDir({ 'SYSTEM.md': '工作目录：{{cwd}}\n预设目录：{{presetDir}}' })
   const ctx = makeCtx(pathToFileURL(dir).href)
   registerPrompt(ctx, {})
-  const read = ctx.variables.get(PROMPT_VARIABLE)
+  const read = ctx.variables.get(COMPANION_PERSONA_VARIABLE)
   const session = (cwd) => ({ agent: { session: { id: 's1', header: { cwd } } } })
 
   assert.equal(read(session('D:/ws')), `工作目录：D:/ws\n预设目录：${dir}`)
@@ -458,7 +478,7 @@ test('registerPrompt：模板里未出现的占位符不影响输出', () => {
   const dir = makePresetDir({ 'AGENTS.md': '这个预设目录（{{presetDir}}）就是你的家' })
   const ctx = makeCtx(pathToFileURL(dir).href)
   registerPrompt(ctx, {})
-  assert.equal(ctx.variables.get(PROMPT_VARIABLE)(asSession('s1')), `这个预设目录（${dir}）就是你的家`)
+  assert.equal(ctx.variables.get(COMPANION_PERSONA_VARIABLE)(asSession('s1')), `这个预设目录（${dir}）就是你的家`)
   rmSync(dir, { recursive: true, force: true })
 })
 
@@ -466,7 +486,7 @@ test('registerPrompt：取不到会话 id 时按 cwd 分桶，不共用同一份
   const dir = makePresetDir({ 'SYSTEM.md': '工作目录：{{cwd}}' })
   const ctx = makeCtx(pathToFileURL(dir).href)
   const prompt = registerPrompt(ctx, {})
-  const read = ctx.variables.get(PROMPT_VARIABLE)
+  const read = ctx.variables.get(COMPANION_PERSONA_VARIABLE)
 
   // 没有 session.id / agent.id 的上下文
   const noId = (cwd) => ({ session: { header: { cwd } } })
@@ -540,7 +560,7 @@ test('registerPrompt：总量超预算时把收敛提醒附在提示词末尾', 
   const ctx = makeCtx(pathToFileURL(dir).href)
   // 预算/超限提醒现在只能经 getSettings 提供（静态 options 回退已随开关移除）
   registerPrompt(ctx, { getSettings: () => ({ contextBudget: 1000, budgetNotice: true }) })
-  const text = ctx.variables.get(PROMPT_VARIABLE)(asSession('s1'))
+  const text = ctx.variables.get(COMPANION_PERSONA_VARIABLE)(asSession('s1'))
   assert.ok(text.includes('## 上下文预算提醒'))
   rmSync(dir, { recursive: true, force: true })
 })
@@ -549,7 +569,7 @@ test('registerPrompt：总量没超预算时提示词里没有提醒', () => {
   const dir = makePresetDir({ 'MEMORY.md': '一'.repeat(100) })
   const ctx = makeCtx(pathToFileURL(dir).href)
   registerPrompt(ctx, { getSettings: () => ({ contextBudget: 1000, budgetNotice: true }) })
-  const text = ctx.variables.get(PROMPT_VARIABLE)(asSession('s1'))
+  const text = ctx.variables.get(COMPANION_PERSONA_VARIABLE)(asSession('s1'))
   assert.ok(!text.includes('上下文预算提醒'))
   rmSync(dir, { recursive: true, force: true })
 })
@@ -558,7 +578,7 @@ test('registerPrompt：超限提醒可单独关掉（只度量不注入）', () 
   const dir = makePresetDir({ 'MEMORY.md': '一'.repeat(3000) })
   const ctx = makeCtx(pathToFileURL(dir).href)
   registerPrompt(ctx, { getSettings: () => ({ contextBudget: 1000, budgetNotice: false }) })
-  const text = ctx.variables.get(PROMPT_VARIABLE)(asSession('s1'))
+  const text = ctx.variables.get(COMPANION_PERSONA_VARIABLE)(asSession('s1'))
   assert.ok(!text.includes('上下文预算提醒'), '关掉后不该注入提醒')
   assert.ok(text.includes('一'), '正文照常注入')
   rmSync(dir, { recursive: true, force: true })

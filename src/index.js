@@ -1,5 +1,5 @@
 /**
- * dsh-preset-md 的 Host 半（bundle 行，host 平面）：给「伙伴设置」页面提供
+ * dsh-companion 的 Host 半（bundle 行，host 平面）：给「伙伴设置」页面提供
  * HTTP 接口，读写 `<dshHome>/.agent-presets/<id>/` 下的文件。
  *
  * 设计约束：
@@ -7,16 +7,31 @@
  * - 删除 = 移动到 `<dshHome>/.agent-presets-backup/<id>-<时间戳>/`，不真删；
  * - 无第三方依赖：preset.yml 用极简正则读写（只有 name/description/order 三个字段）。
  */
-import { existsSync, mkdirSync, readdirSync, renameSync, statSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { randomUUID, createHash } from 'node:crypto'
 
 import { atomicWrite, enqueue, readText } from './memory-store.mjs'
-import { DEFAULT_SETTINGS, readSettings, resolvePaths, writeSettings } from './settings.mjs'
-import { PRESET_FILES, agentCordisTemplate, renderAllTemplates } from './templates.mjs'
+import {
+  companionFromEvents,
+  injectCompanionPrompt,
+  normalizeCompanion,
+  recordCompanionSelection,
+} from './companion.mjs'
+import {
+  DEFAULT_SETTINGS,
+  deleteBinding,
+  readBindings,
+  readSettings,
+  resolvePaths,
+  writeSettings,
+} from './settings.mjs'
+import { companionPresetMeta, companionPresetPlugins } from './companion-preset.mjs'
+import { PRESET_FILES, renderAllTemplates } from './templates.mjs'
+import { sessionEvents } from './core.js'
 
 /** 路由前缀。 */
-export const ROUTE_PREFIX = '/preset-md'
+export const ROUTE_PREFIX = '/companion'
 
 export { DEFAULT_SETTINGS, readSettings, resolvePaths, writeSettings }
 
@@ -74,7 +89,7 @@ function assertLength(value, max, label) {
  *   name: 2026-09-13   -> Date 实例
  *
  * 官方对类型不符的字段是**静默降级成 undefined**（`text()` 只接受 string），
- * 于是昵称在预设选择器里悄悄消失、回落显示成 `presetmd-xxxx`——不报错，只丢数据。
+ * 于是昵称在预设选择器里悄悄消失、回落显示成 `companion-xxxx`——不报错，只丢数据。
  * 所以这些形态一律强制加引号，让它作为字符串被读回。
  */
 export function isPlainSafe(text) {
@@ -288,10 +303,10 @@ function applyPresetEol(text, eol) {
   return eol === '\r\n' ? String(text).replace(/\n/g, '\r\n') : String(text)
 }
 
-/** 从名字生成合法 id（中文名回落使用 presetmd 前缀，一眼可辨是本插件创建的）。 */
+/** 从名字生成合法 id（中文名回落使用 companion 前缀，一眼可辨是本插件创建的）。 */
 export function generateId(name, existing) {
   const slug = String(name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
-  const base = /^[a-z0-9]/.test(slug) ? slug : 'presetmd'
+  const base = /^[a-z0-9]/.test(slug) ? slug : 'companion'
   for (let i = 0; i < 32; i += 1) {
     const id = `${base}-${randomUUID().slice(0, 4)}`
     if (!existing.has(id)) return id
@@ -306,11 +321,11 @@ export function generateId(name, existing) {
  * 那里的 `Number.MAX_SAFE_INTEGER` 是排序哨兵，拿来做 max+1 会算出无意义的巨大序号。
  */
 export function nextOrder(paths) {
-  if (!existsSync(paths.presetsRoot)) return 0
+  if (!existsSync(paths.companionsRoot)) return 0
   let max = -1
-  for (const entry of readdirSync(paths.presetsRoot, { withFileTypes: true })) {
+  for (const entry of readdirSync(paths.companionsRoot, { withFileTypes: true })) {
     if (!entry.isDirectory() || !PRESET_ID.test(entry.name)) continue
-    const { order } = readPresetMeta(join(paths.presetsRoot, entry.name))
+    const { order } = readPresetMeta(join(paths.companionsRoot, entry.name))
     if (Number.isFinite(order) && order > max && order < Number.MAX_SAFE_INTEGER) max = order
   }
   return max + 1
@@ -318,11 +333,11 @@ export function nextOrder(paths) {
 
 /** 列出全部伙伴（按 order 升序）。 */
 export function listAgents(paths) {
-  if (!existsSync(paths.presetsRoot)) return []
+  if (!existsSync(paths.companionsRoot)) return []
   const rows = []
-  for (const entry of readdirSync(paths.presetsRoot, { withFileTypes: true })) {
+  for (const entry of readdirSync(paths.companionsRoot, { withFileTypes: true })) {
     if (!entry.isDirectory() || !PRESET_ID.test(entry.name)) continue
-    const dir = join(paths.presetsRoot, entry.name)
+    const dir = join(paths.companionsRoot, entry.name)
     const meta = readPresetMeta(dir)
     rows.push({
       id: entry.name,
@@ -340,7 +355,7 @@ export function listAgents(paths) {
  *  UI 载入时拿到它，保存时原样回传，服务端比对不一致就报 409。 */
 export function readAgent(paths, id) {
   if (!PRESET_ID.test(id)) throw new Error(`非法 id：${id}`)
-  const dir = join(paths.presetsRoot, id)
+  const dir = join(paths.companionsRoot, id)
   if (!existsSync(dir)) throw new Error(`伙伴不存在：${id}`)
   const meta = readPresetMeta(dir)
   const files = {}
@@ -384,7 +399,7 @@ export function contentHash(text) {
 export function writeAgentFile(paths, id, file, content, { baseVersion } = {}) {
   if (!PRESET_ID.test(id)) throw new Error(`非法 id：${id}`)
   if (!EDITABLE.has(file)) throw new Error(`不允许写 ${file}`)
-  const dir = join(paths.presetsRoot, id)
+  const dir = join(paths.companionsRoot, id)
   if (!existsSync(dir)) throw new Error(`伙伴不存在：${id}`)
   const target = join(dir, file)
   const text = String(content ?? '')
@@ -400,24 +415,26 @@ export function writeAgentFile(paths, id, file, content, { baseVersion } = {}) {
   })
 }
 
-/** 新建伙伴：生成 id、目录、模板文件、agent.cordis.yml、preset.yml。 */
+/**
+ * 新建伙伴：生成 id、目录、六个模板 MD、preset.yml、memory/。
+ *
+ * **不再生成 bundle 声明**（`cordis.patch.yml` / `package.json`）。
+ * rc2 起官方预设只能由已安装的 bundle 声明，那意味着"新建伙伴 = 装包 + 重启"，
+ * 与"即插即用"不可兼得。伙伴因此回归成本插件自己的数据（`companion/companions/`），
+ * 提示词的独占改由 `complete` section 承担（见 core.js 的 registerPrompt）。
+ *
+ * 因此新建伙伴**无需重启**：写几个文件即可，下拉框立刻能看到。
+ */
 export function createAgent(paths, { name, description = '', userName = '用户' }) {
   const clean = assertLength(String(name ?? '').trim(), MAX_NAME_CHARS, '昵称')
   if (!clean) throw new Error('请输入昵称')
   const desc = assertLength(String(description ?? ''), MAX_DESCRIPTION_CHARS, '个性签名')
   const user = assertLength(String(userName ?? '').trim() || '用户', MAX_NAME_CHARS, '用户名')
-  const existing = new Set(
-    existsSync(paths.presetsRoot)
-      ? readdirSync(paths.presetsRoot, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name)
-      : [],
-  )
-  const id = generateId(clean, existing)
-  const dir = join(paths.presetsRoot, id)
+  const id = generateId(clean, existingIds(paths))
+  const dir = join(paths.companionsRoot, id)
   mkdirSync(dir, { recursive: true })
 
   const order = nextOrder(paths)
-  atomicWrite(join(dir, 'agent.cordis.yml'), agentCordisTemplate())
-  // description 为空则不写该行（官方同样省略空字段，见 writePresetMeta 注释）
   writePresetMeta(dir, { name: clean, description: desc || undefined, order })
   for (const [file, content] of Object.entries(renderAllTemplates({ name: clean, userName: user }))) {
     atomicWrite(join(dir, file), content)
@@ -426,31 +443,36 @@ export function createAgent(paths, { name, description = '', userName = '用户'
   return readAgent(paths, id)
 }
 
+/** 现有伙伴 id 集合（供 generateId 去重）。 */
+function existingIds(paths) {
+  if (!existsSync(paths.companionsRoot)) return new Set()
+  return new Set(
+    readdirSync(paths.companionsRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name),
+  )
+}
+
 /** 复制伙伴：以某伙伴为模板克隆一个同名性格的新伙伴。
- *  保留源的全部 MD 与 agent.cordis.yml（含注入行），把其中出现的源名字面替换为新昵称；
+ *  保留源的全部 MD，把其中出现的源名字面替换为新昵称；
  *  不带历史日记（memory/ 新建为空），description 沿用、order 排到末尾。 */
 export function copyAgent(paths, sourceId, { name } = {}) {
   if (!PRESET_ID.test(sourceId)) throw new Error(`非法 id：${sourceId}`)
-  const srcDir = join(paths.presetsRoot, sourceId)
+  const srcDir = join(paths.companionsRoot, sourceId)
   if (!existsSync(srcDir)) throw new Error(`伙伴不存在：${sourceId}`)
   const sourceMeta = readPresetMeta(srcDir)
   const oldName = sourceMeta.name || sourceId
   const clean = assertLength(String(name ?? '').trim() || `${oldName} 的副本`, MAX_NAME_CHARS, '昵称')
-  const existing = new Set(
-    existsSync(paths.presetsRoot)
-      ? readdirSync(paths.presetsRoot, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name)
-      : [],
-  )
-  const id = generateId(clean, existing)
-  const dir = join(paths.presetsRoot, id)
+  const id = generateId(clean, existingIds(paths))
+  const dir = join(paths.companionsRoot, id)
   mkdirSync(dir, { recursive: true })
 
   const renameIn = (text) => (oldName === clean ? text : text.split(oldName).join(clean))
 
-  // 复制六个 MD 与 agent.cordis.yml（preset.yml 由下方按新名字重写）
+  // 复制六个 MD（preset.yml 由下方按新名字重写）
   for (const entry of readdirSync(srcDir, { withFileTypes: true })) {
     if (!entry.isFile() || entry.name === 'preset.yml') continue
-    if (PRESET_FILES.some((item) => item.file === entry.name) || entry.name === 'agent.cordis.yml') {
+    if (PRESET_FILES.some((item) => item.file === entry.name)) {
       atomicWrite(join(dir, entry.name), renameIn(readText(join(srcDir, entry.name))))
     }
   }
@@ -470,10 +492,59 @@ export function copyAgent(paths, sourceId, { name } = {}) {
   return readAgent(paths, id)
 }
 
+/**
+ * 把一个伙伴目录从**旧位置**（`<dshHome>/.agent-presets/<id>/`）搬到新位置
+ * （`<dshHome>/companion/companions/<id>/`）。
+ *
+ * 为什么要搬：rc2 起官方完全不再读 `.agent-presets/`，继续放那里会让"伙伴"
+ * 看起来像官方预设、实际官方不看，排查时极易误判。搬走后该目录是纯粹的本插件数据。
+ *
+ * **只移动，不改内容**：六个 MD、memory/、changelog/、preset.yml 原样过去；
+ * 旧格式遗留的 `agent.cordis.yml` 也一并保留（回滚依据，且现在已无任何作用）。
+ *
+ * @returns {{migrated: boolean, reason?: string, target?: string}}
+ */
+export function migrateAgent(paths, id) {
+  if (!PRESET_ID.test(id)) throw new Error(`非法 id：${id}`)
+  const from = join(paths.legacyPresetsRoot, id)
+  const to = join(paths.companionsRoot, id)
+  if (existsSync(to)) return { migrated: false, reason: '新位置已存在同名伙伴', target: to }
+  if (!existsSync(from)) return { migrated: false, reason: '旧位置没有这个伙伴' }
+  mkdirSync(dirname(to), { recursive: true })
+  try {
+    renameSync(from, to)
+  } catch {
+    // 跨卷时 rename 会失败，退回递归拷贝后删源，保证迁移仍能完成。
+    cpSync(from, to, { recursive: true })
+    rmSync(from, { recursive: true, force: true })
+  }
+  return { migrated: true, target: to }
+}
+
+/**
+ * 列出还留在旧位置、可以迁移过来的伙伴 id。
+ *
+ * 判据是"目录里有 preset.yml 或六个 MD 之一"——只看目录名会把用户在
+ * `.agent-presets/` 下随手建的无关目录也算进来。
+ */
+export function listLegacyAgents(paths) {
+  if (!existsSync(paths.legacyPresetsRoot)) return []
+  return readdirSync(paths.legacyPresetsRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .filter((id) => PRESET_ID.test(id))
+    .filter((id) => !existsSync(join(paths.companionsRoot, id)))
+    .filter((id) => {
+      const dir = join(paths.legacyPresetsRoot, id)
+      return existsSync(join(dir, 'preset.yml'))
+        || PRESET_FILES.some((item) => existsSync(join(dir, item.file)))
+    })
+}
+
 /** 删除 = 移动到备份目录（不真删）。 */
 export function archiveAgent(paths, id, now = new Date()) {
   if (!PRESET_ID.test(id)) throw new Error(`非法 id：${id}`)
-  const dir = join(paths.presetsRoot, id)
+  const dir = join(paths.companionsRoot, id)
   if (!existsSync(dir)) throw new Error(`伙伴不存在：${id}`)
   const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}-${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`
   const target = join(paths.backupRoot, `${id}-${stamp}`)
@@ -485,7 +556,7 @@ export function archiveAgent(paths, id, now = new Date()) {
 /** 日记列表（日期倒序）。id 与日期都做校验，避免路径穿越。 */
 export function listJournal(paths, id) {
   if (!PRESET_ID.test(id)) throw new Error(`非法 id：${id}`)
-  const dir = join(paths.presetsRoot, id, 'memory')
+  const dir = join(paths.companionsRoot, id, 'memory')
   if (!existsSync(dir)) return []
   const rows = []
   for (const name of readdirSync(dir)) {
@@ -502,7 +573,7 @@ export function listJournal(paths, id) {
 export function readJournal(paths, id, date) {
   if (!PRESET_ID.test(id)) throw new Error(`非法 id：${id}`)
   if (!DATE_KEY.test(date)) throw new Error(`非法日期：${date}`)
-  return readText(join(paths.presetsRoot, id, 'memory', `${date}.md`))
+  return readText(join(paths.companionsRoot, id, 'memory', `${date}.md`))
 }
 
 /* ────────────────────────────── HTTP ────────────────────────────── */
@@ -587,7 +658,7 @@ export function statusOfError(error) {
  * （`lib/index.js` 的 `Service.init`，唯一中间件是可选 gzip）。官方确实有
  * 一道 fence（`dsh-client-connection` 的 `isTrustedApiRequest`：校验 host 回环 +
  * `sec-fetch-site !== 'cross-site'` + Origin 同源，不给过就 403），但它只挂在
- * **`/api` 那一条 channel** 上。本插件注册的 `/preset-md` 是独立 route，
+ * **`/api` 那一条 channel** 上。本插件注册的 `/companion` 是独立 route，
  * 完全不经过它——这里是唯一防线。
  *
  * 不设防的后果不是「读数据」，而是**在用户的预设目录里凭空造伙伴**：
@@ -627,9 +698,157 @@ export function isSameOriginRequest(req) {
 /** 读方法不写盘，不参与来源校验。 */
 const WRITE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
 
-/** 注册 `/preset-md` 前缀路由。 */
+/** 取会话事件（走官方的公开读取 API，不读私有字段）。 */
+function readSessionEvents(session) {
+  try {
+    return sessionEvents(session) ?? []
+  } catch {
+    return []
+  }
+}
+
+/** 把任意异常压成一行可读文本（打日志用）。 */
+function describeError(error) {
+  return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * 读一个会话当前绑定的伙伴。
+ *
+ * 两读法并存，顺序有讲究：
+ * 1. **绑定表**（`bindings.json`）—— 现在的正道，按 sessionId 索引；
+ * 2. **事件流兜底** —— 只为兼容历史上已经写进会话日志的旧绑定事件。
+ *
+ * 为什么还留兜底：那些旧事件我们已无法再写（见 companion.mjs 的说明），
+ * 但它们确实存在于用户磁盘上的历史会话里，直接不认会让"老会话的伙伴"丢失。
+ *
+ * @returns 伙伴 id，或 null（从未绑定 / 显式选了「无伙伴」）。
+ */
+function companionBindingOf(paths, session) {
+  const fromTable = readBindings(paths)[session?.id]
+  if (fromTable !== undefined) return fromTable ? normalizeCompanion(fromTable) : null
+  // 兜底：事件流里出现过绑定事件则以最后一次为准
+  const events = readSessionEvents(session)
+  return events.some((event) => event?.type === 'companion/selected')
+    ? companionFromEvents(events)
+    : null
+}
+
+/**
+ * 伙伴绑定是否还允许修改。
+ *
+ * 规则（用户要求）：**开对话前可选，开对话后锁定**。
+ *
+ * 判据取官方 `SessionSnapshot` 的同名语义：
+ * - `blank === false`：会话已经开始过
+ * - `promptAttempted === true`：已经提交过第一条消息
+ *
+ * 任一成立即视为"已开始"。会话没有这些字段时（老版本 / 极早期）保守地
+ * **允许**修改 —— 宁可让用户在极少数情况下多改一次，也不要让所有人都改不了。
+ */
+function canRebind(session) {
+  if (!session) return false
+  if (session.blank === false) return false
+  if (session.promptAttempted === true) return false
+  return true
+}
+
+/** 注册 `/companion` 前缀路由。 */
 export function registerRoutes(ctx, home) {
   const paths = resolvePaths(home)
+
+  /*
+   * 会话索引：sessionId -> Session，供伙伴下拉写入绑定。
+   *
+   * 由 `agent/created` 维护、`agent/disposed` 清理。这样下拉只需要传一个
+   * sessionId，Host 侧就能拿到真正的 Session 对象去追加事件 —— 客户端
+   * 不该、也不能直接写会话日志。
+   */
+  const sessionIndex = new Map()
+  /*
+   * 每个会话的提示词注入句柄：sessionId -> injectCompanionPrompt 的返回值。
+   *
+   * 注册发生在**该会话自己的 scope** 里（`agent/created` 监听器的 `this`），
+   * 所以每个会话有一套独立的 section/变量，互不干扰 —— 这正是"官方预设 +
+   * 伙伴共存"的关键：没绑伙伴的会话根本不注册，官方提示词原样生效。
+   */
+  const injections = new Map()
+  /*
+   * sessionId -> **该会话 scope 的 ctx**。
+   *
+   * 必须在这里存下来：`agent/created` 监听器的 `this` 就是 agent scope，
+   * 但监听器只跑一次；用户之后在"新建对话"页选伙伴时（走 /api/companion）
+   * 还需要这个 ctx 才能把 section 注册进同一个 scope。
+   */
+  const agentCtxBySession = new Map()
+  const agentCtxOf = (sessionId) => agentCtxBySession.get(sessionId)
+
+  ctx.on?.('agent/created', function (payload) {
+    const agent = payload?.agent
+    const session = agent?.session
+    if (!session?.id) return
+    sessionIndex.set(session.id, session)
+    /*
+     * ⚠️ 这里必须存 **`agent.ctx`**，不能存监听器的 `this`。
+     *
+     * 官方把 `agent/created` 的 `this` 标为 `Scoped<Agent>`
+     * （`dsh-agent/lib/types/runtime-types.d.ts:227`），而 `Scoped<T>` 的定义是
+     * `object & { readonly [ScopedBrand]: T }`（`dsh-scope/lib/types/index.d.ts:18`）
+     * —— 它只是个**作用域路由标记**，不是 Context。
+     *
+     * 运行时它由 `scopeTarget(agent, agent)` 构造（`dsh-agent/lib/index.js:231`）。
+     * 实测该对象**只有 `Symbol(cordis.filter)` 一个成员**：
+     *   carrier.systemPrompt === undefined，carrier.effect === undefined
+     * 于是 `this.systemPrompt.section(...)` 必然抛 TypeError，被下面的 catch
+     * 吞成一条 warn —— 表现为"伙伴选好了、绑定也写进会话日志了，
+     * 但提示词里一个字都没有"。
+     *
+     * 真正的 per-agent scope 是 `agent.ctx`（见 `dsh-agent-loop/lib/index.js:778-779`
+     * 的 `this.scope = createScope(loopCtx, this); this.ctx = this.scope.ctx`）；
+     * 官方全部示例（file-reference-local / tool-agent-team 等）用的都是它。
+     */
+    agentCtxBySession.set(session.id, agent?.ctx)
+
+    /*
+     * 建会话时若已带绑定（例如恢复旧会话），就直接装上；
+     * 否则先不注册 —— 用户可能在"新建对话"页选完伙伴才发第一条消息，
+     * 那时由 /api/companion 补上。
+     *
+     * 读法：先查绑定表，再兜底折叠事件流（兼容历史上写进日志的旧绑定）。
+     */
+    const bound = companionBindingOf(paths, session)
+    if (!bound) return
+    const dir = join(paths.companionsRoot, bound)
+    if (!existsSync(dir)) return
+    const agentCtx = agent?.ctx
+    if (!agentCtx) {
+      ctx.logger?.warn?.(`[companion] 会话 ${session.id} 取不到 agent.ctx，提示词注入跳过`)
+      return
+    }
+    try {
+      // 在 `agent.ctx` 里注册即 per-session。
+      injections.set(session.id, injectCompanionPrompt(agentCtx, dir, () => readSettings(paths)))
+    } catch (error) {
+      ctx.logger?.warn?.(`[companion] 会话 ${session.id} 的提示词注入注册失败：${describeError(error)}`)
+    }
+  })
+
+  ctx.on?.('agent/disposed', (payload) => {
+    const session = payload?.agent?.session
+    if (!session?.id) return
+    sessionIndex.delete(session.id)
+    agentCtxBySession.delete(session.id)
+    /*
+     * 绑定表按 sessionId 索引，必须随会话销毁清理 ——
+     * 否则每开一个会话就多一行，文件无限增长（这正是当初选事件流、
+     * 靠"会话删除即日志删除"自动一致的理由）。
+     */
+    try { deleteBinding(paths, session.id) } catch { /* 清理失败不影响销毁 */ }
+    // 会话销毁时撤掉该会话的 section/变量，避免泄漏到别的会话。
+    try { injections.get(session.id)?.dispose() } catch { /* 已撤 */ }
+    injections.delete(session.id)
+  })
+
   const guard = (fn) => async (req, res) => {
     try {
       await fn(req, res)
@@ -637,7 +856,7 @@ export function registerRoutes(ctx, home) {
       const message = error instanceof Error ? error.message : String(error)
       const status = statusOfError(error)
       // 未知异常才是 500：这时才值得记一条 warn，业务错误不必刷日志
-      if (status >= 500) ctx.logger?.warn?.(`[preset-md] 请求处理失败：${message}`)
+      if (status >= 500) ctx.logger?.warn?.(`[companion] 请求处理失败：${message}`)
       sendJson(res, status, { error: message })
     }
   }
@@ -655,7 +874,7 @@ export function registerRoutes(ctx, home) {
        * 否则跨站请求还能靠超大 body 逼我们读满再拒。
        */
       if (WRITE_METHODS.has(method) && !isSameOriginRequest(req)) {
-        ctx.logger?.warn?.(`[preset-md] 拒绝跨站写请求：${method} ${rest}`)
+        ctx.logger?.warn?.(`[companion] 拒绝跨站写请求：${method} ${rest}`)
         return sendJson(res, 403, { error: '拒绝来自其他站点的写请求' })
       }
 
@@ -670,6 +889,78 @@ export function registerRoutes(ctx, home) {
         const body = await readJson(req)
         if (!body) return sendJson(res, 400, { error: '请求体不是合法 JSON' })
         return sendJson(res, 200, { settings: writeSettings(paths, body) })
+      }
+
+      /*
+       * 伙伴下拉用：列出可用伙伴 + 读/写当前会话的绑定。
+       *
+       * 绑定住在插件自己的 `bindings.json`（按 sessionId 索引），
+       * **不再写进会话事件流** —— 原因见 companion.mjs 的顶部说明：
+       * 官方 v4 门禁会拒绝解读带未知事件类型的日志，那会让会话直接打不开。
+       */
+      if (rest === '/api/companions' && method === 'GET') {
+        /*
+         * `?session=<id>` 时顺带回当前绑定。
+         *
+         * 下拉必须知道"这个会话现在用哪个伙伴"才能显示正确的那一项；
+         * 会话不在索引里（例如已关闭）就回 null —— 不是错误，
+         * 列表本身仍然有效，用户可以看但不能改。
+         */
+        const wanted = url.searchParams.get('session')
+        const live = wanted ? sessionIndex.get(wanted) : undefined
+        return sendJson(res, 200, {
+          companions: listAgents(paths).map((item) => ({ id: item.id, name: item.name, description: item.description })),
+          current: live ? companionBindingOf(paths, live) : readBindings(paths)[wanted] ?? null,
+        })
+      }
+      if (rest === '/api/companion' && method === 'PUT') {
+        const body = await readJson(req)
+        if (!body) return sendJson(res, 400, { error: '请求体不是合法 JSON' })
+        const wanted = normalizeCompanion(body.companion)
+        // 选了具体伙伴时必须真实存在，否则会变成"静默不注入"——那太难排查。
+        if (wanted && !existsSync(join(paths.companionsRoot, wanted))) {
+          return sendJson(res, 404, { error: `伙伴不存在：${wanted}` })
+        }
+        const sessionId = typeof body.session === 'string' ? body.session : ''
+        const session = sessionIndex.get(sessionId)
+        if (!session) return sendJson(res, 409, { error: '该会话已不在运行，无法修改伙伴绑定' })
+        if (!canRebind(session)) {
+          return sendJson(res, 409, { error: '对话已开始，伙伴不可更改（新开一个对话即可重新选择）' })
+        }
+        recordCompanionSelection(paths, sessionId, wanted)
+
+        /*
+         * 立刻把注入换成新绑定 —— 用户选完伙伴就要生效，不能等到下次重启。
+         *
+         * 三个分支：
+         * - 原来没注入、现在选了伙伴 -> 新建注入
+         * - 原来有注入、现在换/取消 -> refresh（空串即撤掉全部 section）
+         * - 选了「无伙伴」且原本就没有 -> 什么都不做（保持官方提示词）
+         *
+         * 注意"取消伙伴"必须真的**撤掉 section**，而不是让它渲染成空串：
+         * 空文本的 complete 段会把系统提示词清成 ""（见 core.js 的说明）。
+         */
+        try {
+          const dir = wanted ? join(paths.companionsRoot, wanted) : ''
+          const existing = injections.get(sessionId)
+          if (existing) {
+            existing.refresh(dir)
+            if (!dir) {
+              existing.dispose()
+              injections.delete(sessionId)
+            }
+          } else if (dir) {
+            const agentCtx = agentCtxOf(sessionId)
+            if (agentCtx) {
+              injections.set(sessionId, injectCompanionPrompt(agentCtx, dir, () => readSettings(paths)))
+            } else {
+              ctx.logger?.warn?.(`[companion] 会话 ${sessionId} 的 agent scope 不可用，注入将在下次装配时缺省`)
+            }
+          }
+        } catch (error) {
+          ctx.logger?.warn?.(`[companion] 切换伙伴注入失败：${describeError(error)}`)
+        }
+        return sendJson(res, 200, { current: wanted })
       }
 
       const agentMatch = /^\/api\/agents\/([a-z0-9][a-z0-9-]*)(\/.*)?$/.exec(rest)
@@ -687,7 +978,7 @@ export function registerRoutes(ctx, home) {
       if (sub === '/meta' && method === 'PUT') {
         const body = await readJson(req)
         if (!body) return sendJson(res, 400, { error: '请求体不是合法 JSON' })
-        const dir = join(paths.presetsRoot, id)
+        const dir = join(paths.companionsRoot, id)
         if (!existsSync(dir)) return sendJson(res, 404, { error: `伙伴不存在：${id}` })
         const current = readPresetMeta(dir)
         // 昵称不允许清空：静默把 name 行写没会让 preset.yml 丢字段，
@@ -728,9 +1019,35 @@ export function registerRoutes(ctx, home) {
   })
 }
 
-export const name = 'preset-md-host'
+export const name = 'companion-host'
 export const inject = ['webServer']
 
 export function apply(ctx, config = {}) {
   registerRoutes(ctx, config.dshHome)
+
+  /*
+   * 注册「伙伴模式」预设（声明式，rc2 官方通道）。
+   *
+   * 为什么必须走这里：rc2 起官方不再读 `.agent-presets/<id>/agent.cordis.yml`，
+   * 伙伴的轻量工具清单此前从未生效——实测伙伴会话跑的是 standard-gitbash 的
+   * 51 个工具（含 workflow / subagent / plan mode / goal）。唯一官方通道是
+   * `ctx.agentPresets.register(...)`（活样本 dsh-gitbash-shell/src/index.js:2031）。
+   *
+   * 用 `ctx.inject(['agentPresets'], ...)` 而不是直接 `ctx.agentPresets`：
+   * 该服务并非处处可用（headless profile 就没有），缺了它顶多少一个预设，
+   * 不该把整个 host 半（路由/注入）一起带崩。
+   */
+  try {
+    ctx.inject(['agentPresets'], (scope) => {
+      const registry = scope?.agentPresets
+      if (!registry || typeof registry.register !== 'function') return
+      const unregister = registry.register({
+        ...companionPresetMeta(),
+        plugins: companionPresetPlugins(),
+      })
+      scope.effect?.(() => unregister, 'companion: companion preset registration')
+    })
+  } catch (error) {
+    ctx.logger?.warn?.(`[companion] 伙伴模式预设注册失败：${describeError(error)}`)
+  }
 }

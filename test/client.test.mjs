@@ -54,8 +54,8 @@ function load(extraModules = {}) {
 /** 取出 factory 里的内部件，做单元断言。 */
 function introspect() {
   const probe = SOURCE.replace(
-    "return { apply, inject: ['slots'], name: 'preset-md-client' }",
-    "return { apply, inject: ['slots'], name: 'preset-md-client', __test: { Dialog, CSS, ParamsTab, AgentDetail, TabBar } }",
+    "return { apply, inject: ['slots'], name: 'companion-client' }",
+    "return { apply, inject: ['slots'], name: 'companion-client', __test: { Dialog, CSS, ParamsTab, AgentDetail, TabBar, CompanionPicker } }",
   )
   assert.notEqual(probe, SOURCE, '未能在 client.js 里定位 return 语句，测试探针需要同步更新')
   let registration = null
@@ -208,8 +208,8 @@ function mountParams({ initial = {}, failPut = false } = {}) {
 /** 用指定的 React 桩取内部件。`windowStub` 用于注入 / 观测 `window.confirm`。 */
 function introspectWith(ReactImpl, windowStub = {}) {
   const probe = SOURCE.replace(
-    "return { apply, inject: ['slots'], name: 'preset-md-client' }",
-    "return { apply, inject: ['slots'], name: 'preset-md-client', __test: { Dialog, CSS, ParamsTab, AgentDetail, TabBar } }",
+    "return { apply, inject: ['slots'], name: 'companion-client' }",
+    "return { apply, inject: ['slots'], name: 'companion-client', __test: { Dialog, CSS, ParamsTab, AgentDetail, TabBar, CompanionPicker } }",
   )
   assert.notEqual(probe, SOURCE, '未能在 client.js 里定位 return 语句，测试探针需要同步更新')
   let registration = null
@@ -229,26 +229,51 @@ const saveButton = (tree) => findAll(tree, (n) => n.type === 'button' && textOf(
 const treeText = (tree) => textOf(tree).join('')
 
 
-test('client bundle 注册了 dsh-preset-md', () => {
+test('client bundle 注册了 dsh-companion', () => {
   const { registration } = load()
   assert.ok(registration, 'factory 未通过 __ModuleLoader__.load 注册')
-  assert.equal(registration.id, 'dsh-preset-md')
+  assert.equal(registration.id, 'dsh-companion')
 })
 
-test('factory 不 require 任何官方 UI 包（只依赖 react）', () => {
-  const required = [...SOURCE.matchAll(/require\(\s*['"]([^'"]+)['"]\s*\)/g)].map((m) => m[1])
-  assert.deepEqual(
-    [...new Set(required)].sort(),
-    ['react'],
-    'client 半出现了 react 以外的 require；官方包名在 DSH 版本间会变，必须先验证其存在',
-  )
+/*
+ * 这条锁的是「官方包取不到也不能拖垮整页」，不是「一个字都不许提官方包」。
+ *
+ * 原判据是「源码里除 react 外不得出现任何 require 包名」，但那个判据与事故脱节：
+ * 真正让整页变裸 HTML 的是 **factory 顶层解构官方包 → 抛错 → apply 从不执行**，
+ * 而不是「提到了官方包」。按包名扫源码既误伤安全用法，又放过了危险用法
+ * （顶层 require 一个名字没变过但会抛错的包同样拦不住）。
+ *
+ * 现行做法：官方图标 require 包在 try/catch 内并带内联 SVG 回退。所以这里改为
+ * 断言该 require 被 try/catch 包住 —— 这才是与事故等价的判据。
+ */
+test('client 对官方包的 require 必须被 try/catch 包住（取不到也不得抛错）', () => {
+  const official = [...SOURCE.matchAll(/require\(\s*['"]((?!react['"])[^'"]+)['"]\s*\)/g)].map((m) => m[1])
+  for (const name of new Set(official)) {
+    // 取该 require 出现处往前一小段，确认它落在 try 块内。
+    const index = SOURCE.indexOf(`require('${name}')`) >= 0
+      ? SOURCE.indexOf(`require('${name}')`)
+      : SOURCE.indexOf(`require("${name}")`)
+    const before = SOURCE.slice(Math.max(0, index - 240), index)
+    assert.ok(
+      /try\s*\{[^]*$/.test(before),
+      `client 半在 try/catch 之外 require 了官方包 ${name}；` +
+      '取不到时会在 factory 顶层抛错 → apply 从不执行 → 整页裸样式',
+    )
+  }
+})
+
+test('官方图标包取不到时，三个图标回退到内联 SVG（不抛错）', () => {
+  // load() 的 require 桩对非 react 一律抛错，正好模拟「官方包不存在」。
+  const { registration } = load()
+  const plugin = registration.factory((s) => (s === 'react' ? React : (() => { throw new Error(s) })()))
+  assert.equal(typeof plugin.apply, 'function', '官方包取不到时 factory 仍应返回可用 plugin')
 })
 
 test('factory 能跑完并返回可用 plugin（不再因顶层解构抛错）', () => {
   const { registration } = load()
   const plugin = registration.factory((s) => (s === 'react' ? React : (() => { throw new Error(s) })()))
   assert.equal(typeof plugin.apply, 'function')
-  assert.equal(plugin.name, 'preset-md-client')
+  assert.equal(plugin.name, 'companion-client')
   assert.deepEqual(plugin.inject, ['slots'])
 })
 
@@ -257,9 +282,9 @@ test('apply 会注入样式，并注册 settings.section 槽位', () => {
   const plugin = registration.factory((s) => (s === 'react' ? React : (() => { throw new Error(s) })()))
 
   const registered = []
-  let injectedSlot = null
+  const injectedSlots = []
   const slots = {
-    inject: (name, cb) => { injectedSlot = name; cb() },
+    inject: (name, cb) => { injectedSlots.push(name); cb() },
     register: (meta, component) => { registered.push({ meta, component }); return {} },
   }
   plugin.apply({ slots })
@@ -268,12 +293,59 @@ test('apply 会注入样式，并注册 settings.section 槽位', () => {
   assert.equal(injected.length, 1, 'apply 未注入 <style>')
   const css = injected[0].textContent
   assert.ok(css.length > 0, '注入的样式为空')
-  // 2) 槽位注册照旧
-  assert.equal(injectedSlot, 'settings.section')
-  assert.equal(registered.length, 1)
-  assert.equal(registered[0].meta.id, 'preset-md')
-  assert.equal(registered[0].meta.label, '伙伴设置')
-  assert.equal(typeof registered[0].component, 'function')
+  // 2) 设置页槽位照旧
+  const settings = registered.find((item) => item.meta.name === 'settings.section')
+  assert.ok(settings, '未注册设置页槽位')
+  assert.equal(settings.meta.id, 'companion')
+  assert.equal(settings.meta.label, '伙伴设置')
+  assert.equal(typeof settings.component, 'function')
+})
+
+test('apply 会把自己 id 的伙伴下拉挂到 conversation.input.left（不顶掉官方项）', () => {
+  /*
+   * 官方对 `conversation.input.left` 的契约是：
+   *   "Use an id of your own: a fresh id is added BESIDE the shipped entries,
+   *    while reusing a shipped id puts you in THAT cell and replaces it."
+   *
+   * 所以这里锁两件事：① 挂到了这个 slot；② 用的是**自有 id** ——
+   * 一旦有人把它改成官方已有的 id，就成了"替换官方控件"，必须被挡下。
+   */
+  const { registration, injected } = load()
+  const plugin = registration.factory((s) => (s === 'react' ? React : (() => { throw new Error(s) })()))
+
+  const registered = []
+  const injectedSlots = []
+  const slots = {
+    inject: (name, cb) => { injectedSlots.push(name); cb() },
+    register: (meta, component) => { registered.push({ meta, component }); return {} },
+  }
+  plugin.apply({ slots })
+
+  assert.ok(injectedSlots.includes('conversation.input.left'), '未挂到输入框工具栏 slot')
+  const picker = registered.find((item) => item.meta.name === 'conversation.input.left')
+  assert.ok(picker, '未注册伙伴下拉')
+  assert.equal(picker.meta.id, 'companion-mode', '必须用自有 id，否则会替换官方控件')
+  assert.equal(typeof picker.component, 'function')
+})
+
+test('conversation.input.left 不存在时不抛错，其余功能照常', () => {
+  /*
+   * 旧版 dsh 没有这个 slot（或 slots 实现不同）。此时必须静默降级：
+   * 设置页照常可用，不能因为下拉挂不上就把整个 client 带崩。
+   */
+  const { registration, injected } = load()
+  const plugin = registration.factory((s) => (s === 'react' ? React : (() => { throw new Error(s) })()))
+
+  const registered = []
+  const slots = {
+    inject: (name, cb) => {
+      if (name === 'conversation.input.left') throw new Error('unknown slot')
+      cb()
+    },
+    register: (meta) => { registered.push(meta); return {} },
+  }
+  assert.doesNotThrow(() => plugin.apply({ slots }))
+  assert.ok(registered.some((meta) => meta.name === 'settings.section'), '设置页仍应注册')
 })
 
 test('apply 在 ctx.get("slots") 形态下同样工作，且在缺失时不抛错', () => {
@@ -334,14 +406,14 @@ test('参数表单：每个服务端设置项都必须出现在表单与保存�
   }
 })
 
-test('自建 Dialog 的 className 会与 pmd-dialog-sheet 拼接', () => {
+test('自建 Dialog 的 className 会与 cmd-dialog-sheet 拼接', () => {
   const { Dialog } = introspect()
   const sheetOf = (props) => Dialog({ open: true, title: 't', ...props }).children[0].props.className
 
-  assert.equal(sheetOf({ className: 'pmd-viewer-dialog' }), 'pmd-dialog-sheet pmd-viewer-dialog')
-  assert.equal(sheetOf({ className: 'pmd-dialog' }), 'pmd-dialog-sheet pmd-dialog')
+  assert.equal(sheetOf({ className: 'cmd-viewer-dialog' }), 'cmd-dialog-sheet cmd-viewer-dialog')
+  assert.equal(sheetOf({ className: 'cmd-dialog' }), 'cmd-dialog-sheet cmd-dialog')
   // 没有 className 时不留尾随空格
-  assert.equal(sheetOf({}), 'pmd-dialog-sheet')
+  assert.equal(sheetOf({}), 'cmd-dialog-sheet')
   // 闭合时不渲染
   assert.equal(Dialog({ open: false, title: 't' }), null)
 })
@@ -364,7 +436,7 @@ test('Dialog 的遮罩关闭 / 内容不关闭行为正确', () => {
 
 test('弹窗定位所需的 CSS 规则存在', () => {
   const { CSS } = introspect()
-  for (const selector of ['.pmd-overlay{', '.pmd-dialog-sheet{', '.pmd-dialog-head{', '.pmd-dialog-foot{']) {
+  for (const selector of ['.cmd-overlay{', '.cmd-dialog-sheet{', '.cmd-dialog-head{', '.cmd-dialog-foot{']) {
     assert.ok(CSS.includes(selector), `缺少 ${selector} —— 自建弹窗会退化成无定位的裸 div`)
   }
 })
@@ -795,5 +867,196 @@ test('AgentDetail：无改动时切页签不弹确认（不打扰）', async () 
     assert.equal(asked, 0, '没有未保存改动时不该弹确认')
   } finally {
     detail.restore()
+  }
+})
+
+
+/* ─────────────── 伙伴下拉：为什么"看不见" ───────────────
+ * 两个**静默**故障曾经让下拉在界面上完全不出现（既不报错、也没日志）：
+ *
+ * 1. 请求路径写成了 `/api/companions`，而 `API` 已经含 `/api` 段
+ *    （`const API = '/companion/api'`）→ 实际打 `/companion/api/api/companions`
+ *    → 404 → catch 把 phase 置 error → `return null`。
+ * 2. 会话身份取的是 `props.session`，但官方该 slot 的 props 表里没有这个名字
+ *    （声明处为 `renderSlot("conversation.input.left", {})`，传的是空对象），
+ *    会话身份由 standard kit 以 `sessionId` / `useSession` 注入。
+ *    取不到 session → `canPickCompanion` 判为已锁定 → 退化成只读小标签。
+ *
+ * 两条都属于「没有断言就一定会复发」的类型，所以这里直接钉住 URL 与取值来源。
+ * ------------------------------------------------------------------ */
+
+/** 挂载伙伴下拉。`fetch` 被替换成记录请求的桩。 */
+function mountPicker({ sessionId = 's1', session = undefined, companions = [], current = null, fail = false, presetId = 'companion-mode' } = {}) {
+  const calls = []
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url: String(url), method: options?.method ?? 'GET' })
+    if (fail) return { ok: false, status: 404, text: async () => JSON.stringify({ error: 'not found' }) }
+    return { ok: true, status: 200, text: async () => JSON.stringify({ companions, current }) }
+  }
+  const runtime = makeStatefulReact()
+  const { CompanionPicker } = introspectWith(runtime.React)
+  const useSession = (selector) => (selector ? selector(session) : session)
+  /*
+   * 官方读法（dsh-client-ui-agent-preset/lib/client.js:359-363）：
+   * useSessions 的列表投影里 byId[sid].projectionValues.agentPreset。
+   * presetId 缺省即伙伴模式 —— 默认走显形分支，旧用例不必逐个改。
+   */
+  const useSessions = (selector) => selector({ byId: { [sessionId]: { projectionValues: { agentPreset: presetId } } } })
+  return {
+    runtime, calls, originalFetch,
+    mount: () => runtime.mount(() => CompanionPicker({ sessionId, useSession, useSessions })),
+    restore: () => { globalThis.fetch = originalFetch },
+  }
+}
+
+test('伙伴下拉：接口路径不得重复 /api（曾拼成 /companion/api/api/… → 404 静默消失）', async () => {
+  const picker = mountPicker({
+    companions: [{ id: 'lily', name: '莉莉' }],
+    session: { sessionId: 's1', blank: true },
+  })
+  try {
+    picker.mount()
+    await new Promise((resolve) => setImmediate(resolve))
+    picker.runtime.flush()
+
+    assert.equal(picker.calls.length, 1, '应发出一次列表请求')
+    assert.equal(
+      picker.calls[0].url, '/companion/api/companions?session=s1',
+      'API 常量已含 /api 段，再拼一次就是 404（下拉会静默 return null）',
+    )
+  } finally {
+    picker.restore()
+  }
+})
+
+test('伙伴下拉：会话身份取自 sessionId/useSession，取不到就不会退化成只读标签', async () => {
+  /*
+   * blank 会话 = 还没开始，按契约必须**可选**。
+   * 修复前 `props.session` 恒为 undefined → locked=true → 渲染成只读 span，
+   * 用户看到的就是"没有下拉"。
+   */
+  const picker = mountPicker({
+    companions: [{ id: 'lily', name: '莉莉' }],
+    session: { sessionId: 's1', blank: true, promptAttempted: false },
+  })
+  try {
+    picker.mount()
+    await new Promise((resolve) => setImmediate(resolve))
+    const rendered = picker.runtime.flush()
+
+    const button = findAll(rendered, (n) => n.type === 'button' && n.props.className === 'cmd-chip')[0]
+    assert.ok(button, '新建会话里应渲染出可点的下拉按钮，而不是被锁成只读文本')
+    assert.ok(textOf(button).join('').includes('无伙伴'), '未绑定时应显示「无伙伴」')
+
+    // 展开后能列出伙伴 + 「无伙伴」选项
+    button.props.onClick()
+    const opened = picker.runtime.rerender()
+    const items = findAll(opened, (n) => n.props && n.props.className === 'cmd-menu-item')
+    assert.equal(items.length, 2, '菜单应含「无伙伴」与一个伙伴')
+  } finally {
+    picker.restore()
+  }
+})
+
+test('伙伴下拉：选中伙伴走 PUT /companion 并带上 session', async () => {
+  const picker = mountPicker({
+    companions: [{ id: 'lily', name: '莉莉' }],
+    session: { sessionId: 's1', blank: true },
+  })
+  try {
+    picker.mount()
+    await new Promise((resolve) => setImmediate(resolve))
+    let rendered = picker.runtime.flush()
+
+    findAll(rendered, (n) => n.type === 'button' && n.props.className === 'cmd-chip')[0].props.onClick()
+    rendered = picker.runtime.rerender()
+    const lily = findAll(rendered, (n) => n.props && n.props.className === 'cmd-menu-item' && textOf(n).join('') === '莉莉')[0]
+    assert.ok(lily, '菜单里应能按昵称找到伙伴')
+
+    await lily.props.onClick()
+    await new Promise((resolve) => setImmediate(resolve))
+
+    const put = picker.calls.find((item) => item.method === 'PUT')
+    assert.ok(put, '应发出 PUT 请求')
+    assert.equal(put.url, '/companion/api/companion', '同样不得重复 /api 段')
+  } finally {
+    picker.restore()
+  }
+})
+
+test('伙伴下拉：列表为空时不占位置', async () => {
+  const empty = mountPicker({ session: { sessionId: 's1', blank: true } })
+  try {
+    empty.mount()
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(empty.runtime.flush(), null, '一个伙伴都没有时不该出现空下拉')
+  } finally {
+    empty.restore()
+  }
+})
+
+test('伙伴下拉：拉列表失败时不占位置（静默，但绝不渲染半成品）', async () => {
+  /*
+   * 这一条同时是本次事故的**教训记录**：失败路径原本就是 `return null`，
+   * 配上写错的 URL，表现为"下拉凭空不出现、控制台也没动静"。
+   * 保留静默是有意的（不能因为一个可选控件把输入框搞出红字），
+   * 但正因如此，URL 与取值来源必须由上面那几条断言钉死 —— 静默失败没有第二次机会被发现。
+   */
+  const picker = mountPicker({
+    companions: [{ id: 'lily', name: '莉莉' }],
+    session: { sessionId: 's1', blank: true },
+    fail: true,
+  })
+  try {
+    picker.mount()
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(picker.runtime.flush(), null, '请求失败时不该渲染出损坏的下拉')
+  } finally {
+    picker.restore()
+  }
+})
+
+/* ─────────── 显形闸门：仅「伙伴模式」预设 ───────────
+ * 用户要求：选伙伴模式的会话才显示伙伴下拉；其他预设（standard-gitbash 等）
+ * **完全不显示**，编码会话与官方原样一致。
+ * 读法照抄官方 AgentPresetLabel：useSessions → projectionValues.agentPreset。
+ * ------------------------------------------------------------------ */
+
+test('伙伴下拉：仅伙伴模式预设显形，其他预设一个像素都不占', async () => {
+  // null = 投影里没有 agentPreset（blank 新会话 / 旧版本），同样不得显形
+  for (const presetId of ['standard-gitbash', 'standard', 'code-gitbash', null]) {
+    const picker = mountPicker({
+      companions: [{ id: 'lily', name: '莉莉' }],
+      session: { sessionId: 's1', blank: true },
+      presetId,
+    })
+    try {
+      picker.mount()
+      await new Promise((resolve) => setImmediate(resolve))
+      const tree = picker.runtime.flush()
+      assert.equal(tree, null, `预设=${String(presetId)} 时不得渲染任何内容`)
+      assert.equal(picker.calls.length, 0, `预设=${String(presetId)} 时不得发请求`)
+    } finally {
+      picker.restore()
+    }
+  }
+})
+
+test('伙伴下拉：伙伴模式预设下照常显形（闸门不误伤自己）', async () => {
+  const picker = mountPicker({
+    companions: [{ id: 'lily', name: '莉莉' }],
+    session: { sessionId: 's1', blank: true },
+    presetId: 'companion-mode',
+  })
+  try {
+    picker.mount()
+    await new Promise((resolve) => setImmediate(resolve))
+    const tree = picker.runtime.flush()
+    const button = findAll(tree, (n) => n.type === 'button' && n.props.className === 'cmd-chip')[0]
+    assert.ok(button, '伙伴模式会话应渲染下拉')
+    assert.equal(picker.calls.length, 1, '应恰好发一次列表请求')
+  } finally {
+    picker.restore()
   }
 })

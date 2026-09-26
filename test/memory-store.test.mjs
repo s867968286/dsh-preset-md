@@ -24,7 +24,7 @@ import {
   trimChangelog,
 } from '../src/memory-store.mjs'
 
-const makeDir = () => mkdtempSync(join(tmpdir(), 'preset-md-store-'))
+const makeDir = () => mkdtempSync(join(tmpdir(), 'companion-store-'))
 const read = (file) => readFileSync(file, 'utf8')
 
 test('dateKey / timeKey：本地日期与时间格式', () => {
@@ -86,7 +86,7 @@ test('listJournalFiles：凑够 count 个文件，而不是最近 count 个自�
 
 test('listJournalFiles：目录不存在 / 非日期文件 / 非法 count', () => {
   assert.deepEqual(listJournalFiles('', 7), [])
-  assert.deepEqual(listJournalFiles(join(tmpdir(), 'preset-md-不存在-目录'), 7), [])
+  assert.deepEqual(listJournalFiles(join(tmpdir(), 'companion-不存在-目录'), 7), [])
 
   const dir = makeDir()
   mkdirSync(join(dir, MEMORY_DIR), { recursive: true })

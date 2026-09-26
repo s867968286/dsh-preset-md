@@ -13,7 +13,7 @@ import { join } from 'node:path'
 import { changelogPath, dateKey, journalPath } from '../src/memory-store.mjs'
 import { JOURNAL_TOOL_NAME, MEMORY_TOOL_NAME, createJournalTool, createMemoryTool } from '../src/tools.mjs'
 
-const makeDir = () => mkdtempSync(join(tmpdir(), 'preset-md-tools-'))
+const makeDir = () => mkdtempSync(join(tmpdir(), 'companion-tools-'))
 const read = (file) => readFileSync(file, 'utf8')
 
 /* ─────────────────────────── preset_md_journal ─────────────────────────── */
